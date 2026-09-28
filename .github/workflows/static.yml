@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------
+# NMSE.Site - GitHub Pages Deployment
+# Deploys the static HTML/JS/CSS landing page from `NMSE.Site/`
+# to GitHub Pages using the modern actions/deploy-pages workflow.
+#
+# Two-job pipeline:
+#   1. build  - uploads the site directory as a Pages artifact
+#   2. deploy - publishes the artifact to the Pages environment
+#
+# All actions are pinned to immutable commit SHAs to mitigate
+# supply-chain attacks (e.g. the 2025 tj-actions tag-rewrite
+# incident).  When upgrading, update both the SHA and the
+# version comment.
+#
+# --- DISABLED --------------------------------------------------
+# This workflow is currently restricted to workflow_dispatch
+# (manual trigger) only.  To activate it for production use,
+# uncomment the 'push' trigger block below.
+# ---------------------------------------------------------------
+
+name: Deploy NMSE.Site to GitHub Pages
+
+on:
+  # Uncomment the below push block below to enable automatic deploys
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - 'NMSE.Site/**'
+
+  # Allow manual triggering from the Actions tab
+  workflow_dispatch:
+
+# Allow only one concurrent deployment; skip queued runs between
+# the in-progress run and the latest queued run.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Build
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: NMSE.Site
+
+  # Deploy
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
