@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/x-icon" href="images/favicon.ico">
+  <title>NMSE (NO MAN'S SAVE EDITOR)</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- Animated star‑field background -->
+  <canvas id="starfield"></canvas>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <h1 class="logo">NMS<span class="accent">E</span></h1>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero -->
+    <section class="hero">
+      <h2>NO MAN'S SAVE EDITOR</h2>
+      <p>
+        NMSE is <b>the</b> open-source save editor for the game
+        <em>No Man's Sky</em>.<br>Modify inventories, unlock items,
+        tweak discoveries, make backups and more in all 16 game languages&nbsp;&mdash; all from <b><i>the most feature complete editor out there!</i></b>
+      </p>
+    </section>
+
+    <!-- Download + Community -->
+    <div class="card-row">
+      <!-- Download -->
+      <section id="download" class="card">
+        <center>
+        <h3>Download <br> Latest Build</h3>
+        <p>
+          Grab the most recent build directly.
+        </p>
+        <div id="build-info" class="build-info" hidden>
+          <span id="build-number" class="build-number"></span>
+          <span id="build-updated" class="build-updated"></span>
+        </div>
+        <div class="btn-row">
+          <a id="download-link-windows" class="btn" href="#" target="_blank" rel="noopener" aria-label="Download for Windows">
+            <!-- Higher-detail Windows glyph (inline SVG) -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M2 3.5L11 2v8H2z" fill="currentColor"/>
+              <path d="M13 2l9-1v8h-9z" fill="currentColor" opacity="0.95"/>
+              <path d="M2 13l9-1v8L2 20z" fill="currentColor" opacity="0.9"/>
+              <path d="M13 12l9-1v8l-9 1z" fill="currentColor" opacity="0.85"/>
+            </svg>
+            <b>Download</b>
+          </a>
+          <a id="download-link-linux" class="btn" href="#" target="_blank" rel="noopener" aria-label="Download for Linux">
+            <!-- Traditional Tux penguin (black/white/yellow) -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+              <!-- Black body -->
+              <path d="M32 6c-11 0-20 9-20 20 0 7 4 13 8 17 4 4 10 7 12 7s8-3 12-7c4-4 8-10 8-17 0-11-9-20-20-20z" fill="#000000"/>
+              <!-- White belly -->
+              <ellipse cx="32" cy="34" rx="10" ry="14" fill="#FFFFFF"/>
+              <!-- Face (white) -->
+              <ellipse cx="32" cy="22" rx="6" ry="5" fill="#FFFFFF"/>
+              <!-- Eyes (black) -->
+              <circle cx="29" cy="21" r="1.2" fill="#000000"/>
+              <circle cx="35" cy="21" r="1.2" fill="#000000"/>
+              <!-- Beak (yellow) -->
+              <path d="M32 24.5 L28.5 27 L35.5 27 Z" fill="#FFCC33"/>
+              <!-- Feet (yellow) -->
+              <ellipse cx="26" cy="48" rx="3.5" ry="2" fill="#FFCC33"/>
+              <ellipse cx="38" cy="48" rx="3.5" ry="2" fill="#FFCC33"/>
+            </svg>
+            <b>Download</b>
+          </a>
+          <a id="download-link-macos" class="btn" href="#" target="_blank" rel="noopener" aria-label="Download for macOS">
+            <!-- macOS-style icon -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 56" aria-hidden="true" focusable="false">
+              <path d="M32.4 8.1c-2.4 0-6.2 1.7-8.2 1.7-2.1 0-5.2-1.7-8.5-1.7-9 0-12.5 6.7-12.5 14.8 0 5.8 2.9 13.8 6.4 18.4 2.7 3.6 5.9 7.7 10.2 7.6 4.2-0.1 5.8-2.7 10.8-2.7 4.9 0 6.4 2.7 10.4 2.6 4.6-0.1 7.5-3.7 10.2-7.4 1.7-2.3 2.4-3.8 3.8-6.6-9-3.4-9.3-13.5-1.7-17.8-3.7-5.4-10.5-5.9-13.3-6.4-1.9-0.4-4.1-1.4-6.1-1.4z" fill="currentColor"/>
+            </svg>
+            <b>Download</b>
+          </a>
+        </div>
+        <p class="note" id="download-note">Loading latest build info&hellip;</p>
+        </center>
+      </section>
+
+      <!-- Community -->
+      <section id="community" class="card">
+        <center>
+        <h3>Join the Community</h3>
+        <p>
+          Chat with fellow travellers and help shape NMSE.
+        </p>
+        <br><br>
+        <a id="discord-link" class="btn btn-secondary" href="#" target="_blank" rel="noopener">
+          <b>Join us on Discord</b>
+        </a>
+        <p>
+          Found a bug? <a id="dev-issue-link" class="btn btn-inline" href="#" target="_blank" rel="noopener"><b>Open an issue</b></a> on GitHub!
+        </p>
+        </center>
+      </section>
+    </div>
+
+    <!-- Docs -->
+    <section id="docs" class="card">
+      <center>
+      <h3>User Guide & Docs</h3>
+      <p>
+        User guides, FAQs and technical details are all available in the docs:
+      </p>
+      <div class="btn-row">
+        <a id="docs-user-link" class="btn btn-docs" href="#" target="_blank" rel="noopener">
+          <b>User Guide</b>
+        </a>
+        <a id="docs-dev-link" class="btn btn-docs" href="#" target="_blank" rel="noopener">
+          <b>Developer Docs</b>
+        </a>
+      </div>
+      </center>
+    </section>
+
+    <!-- Developer -->
+    <section id="developer" class="card">
+      <center>
+      <h3>Support the Developer</h3>
+      <p>
+        <b>
+        NMSE is created and maintained by
+        <a id="dev-github-link" href="#" target="_blank" rel="noopener">vectorcmdr</a>.
+        </b>
+      </p>
+      <p>
+        This app will always be free and ad-free. If you’ve found it useful, please consider supporting development by:
+      </p>
+      <a id="dev-like-link" class="btn btn-like" href="#" target="_blank" rel="noopener">
+        <b>⭐ Star on GitHub</b>
+      </a>
+      <br>
+      <a id="dev-sponsor-link" class="btn btn-sponsor" href="#" target="_blank" rel="noopener">
+        <b>☕ Donate</b>
+      </a>
+      <p>
+        <br>
+        Stars help users find the project and help developers gain free access to paid GitHub tools.<br>
+        Donations help me cover hosting costs, signing certificate goals and fund future improvements.<br>
+        Every bit of support is greatly appreciated!
+      </p>
+      </center>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>
+      NMSE is a fan-made project by <a id="dev-github-link-footer" href="#" target="_blank" rel="noopener">vectorcmdr</a> provided under <a href="#" target="_blank" rel="noopener">GPL3.0</a> and is not affiliated with Hello Games.
+      <em>No Man's Sky</em> is a trademark of Hello Games Ltd.
+    </p>
+    <p>
+      NMS Geo Sans font made available by <a href="https://github.com/NMSCD/No-Mans-Sky-Universal-Font" target="_blank" rel="noopener">NMSCD</a>.
+    </p>
+  </footer>
+
+  <script src="js/site.js"></script>
+</body>
+</html>

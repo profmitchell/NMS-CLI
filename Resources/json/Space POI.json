@@ -1,0 +1,156 @@
+[
+	{
+		"Type": "AsteroidBelt",
+		"MinCount": 1,
+		"MaxCount": 3,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_ASTEROIDBELT",
+		"Name": "Asteroid Belt "
+	},
+	{
+		"Type": "Hulk",
+		"MinCount": 0,
+		"MaxCount": 3,
+		"ForcedHiddenExtras": 2,
+		"NormalInitialLevel": "Undiscovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": false,
+		"NameLocKey": "UI_SPACEPOI_TYPE_HULK",
+		"Name": "Space Hulk"
+	},
+	{
+		"Type": "Outpost",
+		"MinCount": 1,
+		"MaxCount": 1,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": false,
+		"AllowedInEmptySystem": false,
+		"NameLocKey": "UI_SPACEPOI_TYPE_OUTPOST",
+		"Name": "Deep-space Outpost"
+	},
+	{
+		"Type": "OutpostSlime",
+		"MinCount": 0,
+		"MaxCount": 1,
+		"ForcedHiddenExtras": 1,
+		"NormalInitialLevel": "Undiscovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": false,
+		"NameLocKey": "UI_SPACEPOI_TYPE_OUTPOST_SLIME",
+		"Name": "Infested Outpost"
+	},
+	{
+		"Type": "Star",
+		"MinCount": 1,
+		"MaxCount": 1,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_STAR",
+		"Name": "Star"
+	},
+	{
+		"Type": "BasePlatform",
+		"MinCount": 0,
+		"MaxCount": 2,
+		"ForcedHiddenExtras": 2,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_BASEPLATFORM",
+		"Name": "Habitable Asteroid"
+	},
+	{
+		"Type": "AbandonedFreighter",
+		"MinCount": 0,
+		"MaxCount": 0,
+		"ForcedHiddenExtras": 1,
+		"NormalInitialLevel": "Hidden",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_AF",
+		"Name": "Derelict Freighter"
+	},
+	{
+		"Type": "SpaceWhale",
+		"MinCount": 0,
+		"MaxCount": 0,
+		"ForcedHiddenExtras": 1,
+		"NormalInitialLevel": "Hidden",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_BIOFRIGATE",
+		"Name": "Cosmic Whale"
+	},
+	{
+		"Type": "Flavour",
+		"MinCount": 0,
+		"MaxCount": 2,
+		"ForcedHiddenExtras": 2,
+		"NormalInitialLevel": "Undiscovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_FLAVOUR",
+		"Name": "Anomalous Signal"
+	},
+	{
+		"Type": "Derelict",
+		"MinCount": 0,
+		"MaxCount": 2,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Undiscovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": false,
+		"NameLocKey": "UI_SPACEPOI_TYPE_DERELICT",
+		"Name": "Lost Starship"
+	},
+	{
+		"Type": "WasteSite",
+		"MinCount": 0,
+		"MaxCount": 2,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": false,
+		"NameLocKey": "UI_SPACEPOI_TYPE_WASTESITE",
+		"Name": "Minor Wreckage"
+	},
+	{
+		"Type": "IceField",
+		"MinCount": 0,
+		"MaxCount": 2,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_ICEFIELD",
+		"Name": "Ice Field"
+	},
+	{
+		"Type": "BasePlatform_Ice",
+		"MinCount": 0,
+		"MaxCount": 1,
+		"ForcedHiddenExtras": 2,
+		"NormalInitialLevel": "Discovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_BASEPLATFORM_I",
+		"Name": "Habitable Comet Fragment"
+	},
+	{
+		"Type": "AbandonedBase",
+		"MinCount": 0,
+		"MaxCount": 0,
+		"ForcedHiddenExtras": 0,
+		"NormalInitialLevel": "Undiscovered",
+		"AllowedInAbandonedSystem": true,
+		"AllowedInEmptySystem": true,
+		"NameLocKey": "UI_SPACEPOI_TYPE_ABANDONEDBASE",
+		"Name": "Abandoned Base"
+	}
+]

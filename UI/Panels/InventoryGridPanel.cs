@@ -1,0 +1,4664 @@
+using System.ComponentModel;
+using System.Text.RegularExpressions;
+using NMSE.Core;
+using NMSE.Core.Utilities;
+using NMSE.Data;
+using NMSE.Models;
+using NMSE.UI.Util;
+
+namespace NMSE.UI.Panels;
+
+/// <summary>
+/// A reusable inventory grid panel that displays slots as a visual grid of cells
+/// with item icons and a side detail panel for viewing and editing slot properties.
+/// Supports right-click context menu for adding/removing items, and a cascading
+/// item picker (Type -> Category -> Item) for selecting items from the game database.
+/// </summary>
+public partial class InventoryGridPanel : UserControl
+{
+    public sealed class AutoStackSlotRequestEventArgs : EventArgs
+    {
+        public AutoStackSlotRequestEventArgs(int x, int y, string itemId)
+        {
+            X = x;
+            Y = y;
+            ItemId = itemId;
+        }
+
+        public int X { get; }
+        public int Y { get; }
+        public string ItemId { get; }
+    }
+
+    private enum InventorySortMode
+    {
+        None,
+        Name,
+        Category,
+    }
+
+    private sealed class SortModeOption
+    {
+        public required InventorySortMode Mode { get; init; }
+        public required string Label { get; init; }
+
+        public override string ToString() => Label;
+    }
+
+    // Cells / grid items
+    private const int GridColumns = 10;
+    private const int CellWidth = 72;
+    private const int CellHeight = 104;
+    private const int CellPadding = 4;
+    private const string SuperchargeIndicator = "⚡ ";
+
+    // State
+    private readonly ToolTip _sharedToolTip = new();
+    private readonly List<SlotCell> _cells = new();
+    private SlotCell? _selectedCell;
+    private SlotCell? _contextCell; // Cell that was right-clicked
+    private SlotCell? _copiedItemCell;
+    private JsonArray? _slots;
+    private JsonObject? _currentInventory;
+    private GameItemDatabase? _database;
+    private IconManager? _iconManager;
+    private Label? _maxSupportedLabel;
+
+    // Drag-and-drop state
+    private const int DragThreshold = 6; // Minimum pixels before a drag starts
+    private SlotCell? _dragSourceCell;
+    private Point _dragStartPoint;
+    private bool _isDragging;
+    private SlotCell? _dragHighlightCell; // Currently highlighted drop target
+
+    // Cached item lists for filtering
+    private List<GameItem> _allItems = new();
+    private bool _suppressFilterEvents;
+    private bool _filtersPopulated;
+
+    private ThemeColors.Palette _currentPalette = ThemeColors.Light;
+
+    // Export filename for this inventory
+    private string _exportFileName = "inventory.json";
+
+    // Context-aware file dialog filter and default extension for export/import
+    private string _exportFilter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+    private string _importFilter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+    private string _exportDefaultExt = "json";
+
+    // Corvette tech resolution context
+    private List<CorvettePartEntry>? _corvettePartCollection;
+
+    // Inventory group for stack-size lookups (e.g. "Personal", "Ship", "Freighter")
+    private string _inventoryGroup = "Default";
+    /// <summary>
+    /// Sets the inventory group used to look up default stack sizes from
+    /// <see cref="InventoryStackDatabase"/> when the user picks an item.
+    /// Valid groups: Default, Personal, PersonalCargo, Ship, ShipCargo,
+    /// Freighter, FreighterCargo, Vehicle, Chest, BaseCapsule,
+    /// MaintenanceObject, UIPopup, SeasonTransfer.
+    /// </summary>
+    public void SetInventoryGroup(string group)
+    {
+        _inventoryGroup = group;
+    }
+
+    private bool _pinSlotFeatureEnabled;
+    private readonly HashSet<(int x, int y)> _pinnedSlots = new();
+
+    /// <summary>
+    /// Raised when pinned-slot coordinates change.
+    /// </summary>
+    public event EventHandler? PinnedSlotsChanged;
+
+    public void SetPinSlotFeatureEnabled(bool enabled)
+    {
+        _pinSlotFeatureEnabled = enabled;
+        UpdatePinnedVisuals();
+    }
+
+    public void SetPinnedSlots(IEnumerable<(int x, int y)> pinnedSlots)
+    {
+        _pinnedSlots.Clear();
+        foreach (var pos in pinnedSlots)
+            _pinnedSlots.Add(pos);
+        UpdatePinnedVisuals();
+    }
+
+    public IReadOnlyCollection<(int x, int y)> GetPinnedSlots() => _pinnedSlots.ToArray();
+
+    private bool IsPinnedSlot(int x, int y) => _pinnedSlots.Contains((x, y));
+
+    private void RaisePinnedSlotsChanged() => PinnedSlotsChanged?.Invoke(this, EventArgs.Empty);
+
+    private void UpdatePinnedVisuals()
+    {
+        if (_cells.Count == 0)
+            return;
+
+        foreach (var cell in _cells)
+        {
+            cell.ShowPinToggle = _pinSlotFeatureEnabled && cell.IsActivated;
+            cell.IsPinnedForAutoStack = cell.IsActivated && IsPinnedSlot(cell.GridX, cell.GridY);
+            cell.UpdateDisplay();
+        }
+    }
+
+    private bool _sortingEnabled;
+    private InventorySortMode _currentSortMode;
+    private bool _suppressSortModeEvents;
+    private bool _isApplyingSort;
+
+    public void SetSortingEnabled(bool enabled)
+    {
+        _sortingEnabled = enabled;
+        UpdateToolbarActionVisibility();
+    }
+
+    // Identify storages that can't be resized
+    private bool _isStorageInventory = false;
+    public void SetIsStorageInventory(bool isStorage)
+    {
+        _isStorageInventory = isStorage;
+        UpdateToolbarActionVisibility();
+    }
+
+    // Identify chest inventories that can be resized (up to 10x12)
+    private bool _isChestInventory = false;
+    public void SetIsChestInventory(bool isChest)
+    {
+        _isChestInventory = isChest;
+    }
+
+    // Identify technology-only inventories for charge display and context menu
+    private bool _isTechInventory = false;
+    public void SetIsTechInventory(bool isTech)
+    {
+        _isTechInventory = isTech;
+    }
+
+    // Whether this inventory is a cargo/general inventory (no technology allowed).
+    // Tech items cannot be added to non-tech inventories (post-Waypoint).
+    private bool _isCargoInventory = false;
+    /// <summary>
+    /// Mark this inventory as a cargo/general inventory that should not accept
+    /// technology items. This prevents users from corrupting their save by
+    /// adding technology to a slot that only supports products/substances.
+    /// </summary>
+    public void SetIsCargoInventory(bool isCargo)
+    {
+        _isCargoInventory = isCargo;
+        UpdateToolbarActionVisibility();
+    }
+
+    // Owner type for TechnologyCategory-based item filtering.
+    // Values: "Suit", "Ship"/"Starship", "Weapon"/"Multitool", "Freighter", "Vehicle"/"Exocraft".
+    private string _inventoryOwnerType = "";
+
+    // When > 0, suppress automatic filter refresh from SetInventoryOwnerType.
+    // Call EndBatchUpdate() to apply deferred refreshes.
+    private int _batchUpdateCount;
+    private bool _filterRefreshDeferred;
+
+    /// <summary>
+    /// Begins a batch update.  While in batch mode, <see cref="SetInventoryOwnerType"/>
+    /// will not automatically refresh item filters.  Call <see cref="EndBatchUpdate"/>
+    /// when done to apply any deferred filter refreshes in a single pass.
+    /// Calls may be nested; only the outermost EndBatchUpdate triggers the refresh.
+    /// </summary>
+    public void BeginBatchUpdate()
+    {
+        _batchUpdateCount++;
+    }
+
+    /// <summary>
+    /// Ends a batch update started by <see cref="BeginBatchUpdate"/>. If any
+    /// filter-refresh was deferred during the batch, it is applied now.
+    /// </summary>
+    public void EndBatchUpdate()
+    {
+        if (_batchUpdateCount > 0)
+            _batchUpdateCount--;
+
+        if (_batchUpdateCount == 0 && _filterRefreshDeferred)
+        {
+            _filterRefreshDeferred = false;
+            if (_filtersPopulated)
+                PopulateTypeFilter();
+        }
+    }
+
+    /// <summary>
+    /// Sets the owner type for this inventory, used to filter the item picker
+    /// to only show technologies valid for this entity type.
+    /// </summary>
+    public void SetInventoryOwnerType(string ownerType)
+    {
+        string previous = _inventoryOwnerType;
+        _inventoryOwnerType = ownerType;
+
+        // Auto-refresh the item picker filters when the owner type actually
+        // changes and they have already been built.  This ensures switching
+        // between vehicles / ships of different types immediately updates the
+        // available categories without requiring callers to call RefreshItemFilters.
+        if (_filtersPopulated && !string.Equals(previous, ownerType, StringComparison.Ordinal))
+        {
+            if (_batchUpdateCount > 0)
+                _filterRefreshDeferred = true;
+            else
+                PopulateTypeFilter();
+        }
+    }
+
+    /// <summary>
+    /// Re-populates the item picker type/category/item filters using the current
+    /// owner type and inventory flags. Call after changing the owner type so
+    /// the picker reflects the updated filtering (e.g. switching to Corvette).
+    /// </summary>
+    public void RefreshItemFilters()
+    {
+        if (_filtersPopulated)
+            PopulateTypeFilter();
+    }
+
+    // Disable supercharge modifications (e.g. Exocraft tech slots are fixed in game)
+    private bool _superchargeDisabled = false;
+    public void SetSuperchargeDisabled(bool disabled)
+    {
+        _superchargeDisabled = disabled;
+    }
+
+    // Disable slot enable/disable toggle (e.g. Exocraft tech slots have fixed layout in game)
+    private bool _slotToggleDisabled = false;
+    /// <summary>
+    /// Disables the ability to enable/disable slots in this inventory grid.
+    /// Used for inventories where the slot layout is fixed in-game (e.g. Exocraft tech).
+    /// </summary>
+    public void SetSlotToggleDisabled(bool disabled)
+    {
+        _slotToggleDisabled = disabled;
+    }
+
+    // Supercharge constraints (e.g. Multitool/Starship/Freighter tech: max 4, rows 0-3 only)
+    private int _maxSuperchargedSlots = -1; // -1 = unlimited
+    private int _maxSuperchargeRow = -1;    // -1 = no row restriction (0-based)
+    public void SetSuperchargeConstraints(int maxSlots, int maxRow)
+    {
+        _maxSuperchargedSlots = maxSlots;
+        _maxSuperchargeRow = maxRow;
+    }
+
+    /// <summary>Raised when inventory data is modified by the user.</summary>
+    public event EventHandler? DataModified;
+    private void RaiseDataModified() => DataModified?.Invoke(this, EventArgs.Empty);
+
+    /// <summary>
+    /// Raised when the user requests moving Exosuit cargo items into matching chest stacks.
+    /// The parent panel executes the cross-inventory transfer.
+    /// </summary>
+    public event EventHandler? AutoStackToStorageRequested;
+
+    /// <summary>
+    /// Raised when the user requests moving Exosuit cargo items into the current Starship cargo inventory.
+    /// </summary>
+    public event EventHandler? AutoStackToStarshipRequested;
+
+    /// <summary>
+    /// Raised when the user requests moving Exosuit cargo items into the Freighter cargo inventory.
+    /// </summary>
+    public event EventHandler? AutoStackToFreighterRequested;
+
+    /// <summary>
+    /// Raised when the user requests a context-menu auto-stack operation for the selected slot to chests.
+    /// </summary>
+    public event EventHandler<AutoStackSlotRequestEventArgs>? AutoStackSelectedSlotToStorageRequested;
+
+    /// <summary>
+    /// Raised when the user requests a context-menu auto-stack operation for the selected slot to starship.
+    /// </summary>
+    public event EventHandler<AutoStackSlotRequestEventArgs>? AutoStackSelectedSlotToStarshipRequested;
+
+    /// <summary>
+    /// Raised when the user requests a context-menu auto-stack operation for the selected slot to freighter.
+    /// </summary>
+    public event EventHandler<AutoStackSlotRequestEventArgs>? AutoStackSelectedSlotToFreighterRequested;
+
+    public void RefreshToolbarActions()
+    {
+        UpdateToolbarActionVisibility();
+        UpdateToolbarActionEnabledState();
+    }
+
+    /// <summary>
+    /// Sets the default filename used when exporting this inventory.
+    /// </summary>
+    public void SetExportFileName(string fileName)
+    {
+        _exportFileName = fileName;
+    }
+
+    /// <summary>
+    /// Sets the file dialog filter and default extension for context-aware export/import.
+    /// Call this to override the default .json filter based on the parent panel context.
+    /// </summary>
+    /// <param name="exportFilter">SaveFileDialog filter string using pipe-delimited format
+    /// (e.g. "Ship files (*.nmssc)|*.nmssc|JSON files (*.json)|*.json|All files (*.*)|*.*").
+    /// Use <see cref="ExportConfig.BuildDialogFilter"/> to build this.</param>
+    /// <param name="importFilter">OpenFileDialog filter string using pipe-delimited format.
+    /// Use <see cref="ExportConfig.BuildImportFilter"/> to build this.</param>
+    /// <param name="defaultExt">Default extension without leading dot (e.g. "nmssc").
+    /// Used for both export and import dialogs.</param>
+    public void SetExportFileFilter(string exportFilter, string importFilter, string defaultExt)
+    {
+        _exportFilter = exportFilter;
+        _importFilter = importFilter;
+        _exportDefaultExt = defaultExt;
+    }
+
+    /// <summary>
+    /// Initialises corvette tech resolution context for this inventory.
+    /// Call this before LoadInventory when loading a corvette's tech inventory.
+    /// Finds the PlayerShipBase entry matching the ship index and collects its
+    /// base part objects for matching against CV_ tech items.
+    /// </summary>
+    public void SetCorvetteContext(JsonObject? saveRoot, int shipIndex)
+    {
+        _corvettePartCollection = null;
+        if (saveRoot == null || _database == null) return;
+
+        try
+        {
+            var playerState = saveRoot.GetObject("PlayerStateData");
+            if (playerState == null) return;
+            var bases = playerState.GetArray("PersistentPlayerBases");
+            if (bases == null) return;
+
+            for (int i = 0; i < bases.Length; i++)
+            {
+                var baseObj = bases.GetObject(i);
+                if (baseObj == null) continue;
+                var baseType = baseObj.GetObject("BaseType");
+                if (baseType == null) continue;
+                if ((string?)baseType.Get("PersistentBaseTypes") != "PlayerShipBase") continue;
+                if (baseObj.GetInt("UserData") != shipIndex) continue;
+
+                // Found the matching base - collect all objects
+                var objects = baseObj.GetArray("Objects");
+                if (objects == null) break;
+
+                _corvettePartCollection = new List<CorvettePartEntry>();
+                for (int j = 0; j < objects.Length; j++)
+                {
+                    var obj = objects.GetObject(j);
+                    if (obj == null) continue;
+                    string objectId = (string?)obj.Get("ObjectID") ?? "";
+                    if (objectId.Length > 1 && objectId[0] == '^')
+                        objectId = objectId[1..];
+                    _corvettePartCollection.Add(new CorvettePartEntry { Id = objectId, Found = false });
+                }
+                break;
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Clears corvette tech resolution context.
+    /// </summary>
+    public void ClearCorvetteContext()
+    {
+        _corvettePartCollection = null;
+    }
+
+    /// <summary>
+    /// For a CV_ tech item, guesses which actual base part it corresponds to
+    /// by matching the tech's possible base part refs against the corvette's
+    /// actual Objects. Returns the matched GameItem (base part product) or null.
+    /// Each base object is only matched once (greedy first-match).
+    /// </summary>
+    private GameItem? GuessCorvetteBasePart(string techId)
+    {
+        if (_corvettePartCollection == null || _database == null) return null;
+
+        // Strip ^ and #variant from the tech ID to get base CV_ name
+        string baseId = techId;
+        if (baseId.Length > 0 && baseId[0] == '^') baseId = baseId[1..];
+        var hashIdx = baseId.IndexOf('#');
+        if (hashIdx >= 0) baseId = baseId[..hashIdx];
+
+        // Look up possible base part refs for this CV_ tech
+        if (!_database.CorvetteBasePartTechMap.TryGetValue(baseId, out var possibleParts))
+            return null;
+
+        // Iterate through base objects in order, find first unfound match
+        foreach (var entry in _corvettePartCollection)
+        {
+            if (entry.Found) continue;
+            foreach (var partId in possibleParts)
+            {
+                if (string.Equals(entry.Id, partId, StringComparison.OrdinalIgnoreCase))
+                {
+                    entry.Found = true;
+                    return _database.GetItem(partId);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns true if the item ID is a corvette tech (starts with ^CV_ or CV_).
+    /// </summary>
+    private static bool IsCorvetteTechId(string id)
+    {
+        var raw = id.StartsWith('^') ? id.AsSpan(1) : id.AsSpan();
+        return raw.StartsWith("CV_", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Sets or updates the Max Supported label next to the Resize button.
+    /// </summary>
+    public void SetMaxSupportedLabel(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            if (_maxSupportedLabel != null)
+                _maxSupportedLabel.Visible = false;
+            return;
+        }
+
+        if (_maxSupportedLabel == null)
+        {
+            _maxSupportedLabel = new Label
+            {
+                Text = text,
+                AutoSize = true,
+                ForeColor = Color.Red,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold, GraphicsUnit.Pixel),
+                Margin = new Padding(8, 8, 0, 0)
+            };
+
+            _toolbarPanel?.Controls.Add(_maxSupportedLabel);
+        }
+        else
+        {
+            _maxSupportedLabel.Text = text;
+            _maxSupportedLabel.Visible = true;
+        }
+    }
+
+    public InventoryGridPanel()
+    {
+        InitializeComponent();
+        SetupLayout();
+        PopulateSortModeOptions();
+        RefreshToolbarActions();
+        WireInfoTooltips();
+    }
+
+    /// <summary>
+    /// Wires the info button hover tooltips for the slot detail and picker detail sections.
+    /// The tooltip text is taken from the hidden description label which is populated
+    /// when an item is selected. The tooltip is set to a narrow width so that long
+    /// descriptions wrap into a portrait-shaped popup.
+    /// </summary>
+    private void WireInfoTooltips()
+    {
+        _sharedToolTip.AutoPopDelay = 15000;
+
+        _detailInfoButton.MouseEnter += (s, e) =>
+        {
+            string desc = _detailDescription.Text;
+            if (!string.IsNullOrEmpty(desc))
+                _sharedToolTip.Show(desc, _detailInfoButton, 0, _detailInfoButton.Height + 2);
+        };
+        _detailInfoButton.MouseLeave += (s, e) => _sharedToolTip.Hide(_detailInfoButton);
+
+        _pickerInfoButton.MouseEnter += (s, e) =>
+        {
+            string desc = _pickerDescription.Text;
+            if (!string.IsNullOrEmpty(desc))
+                _sharedToolTip.Show(desc, _pickerInfoButton, 0, _pickerInfoButton.Height + 2);
+        };
+        _pickerInfoButton.MouseLeave += (s, e) => _sharedToolTip.Hide(_pickerInfoButton);
+
+        // Attach Draw handler to word-wrap the tooltip at a narrower width
+        _sharedToolTip.OwnerDraw = true;
+        _sharedToolTip.Popup += (s, e) =>
+        {
+            // Make width constrained to get reasonable word-wrapping for long descriptions
+            const int maxWidth = 180;
+            using var g = Graphics.FromHwnd(IntPtr.Zero);
+            var measured = g.MeasureString(
+                ((ToolTip)s!).GetToolTip(e.AssociatedControl!),
+                SystemFonts.StatusFont!,
+                maxWidth);
+            e.ToolTipSize = new Size((int)Math.Ceiling(measured.Width) + 8, (int)Math.Ceiling(measured.Height) + 6);
+        };
+        _sharedToolTip.Draw += (s, e) =>
+        {
+            e.DrawBackground();
+            e.DrawBorder();
+            using var brush = new SolidBrush(SystemColors.InfoText);
+            var rect = new RectangleF(4, 3, e.Bounds.Width - 8, e.Bounds.Height - 6);
+            e.Graphics.DrawString(e.ToolTipText, SystemFonts.StatusFont!, brush, rect);
+        };
+    }
+
+    private void DisableControlsOnInit()
+    {
+        // Disable NUDs and buttons before inventory is loaded
+        _resizeWidth.Enabled = false;
+        _resizeHeight.Enabled = false;
+        _resizeButton.Enabled = false;
+        _detailAmount.Enabled = false;
+        _detailMaxAmount.Enabled = false;
+        _detailDamageFactor.Enabled = false;
+        _applyButton.Enabled = false;
+        _searchButton.Enabled = false;
+        _typeFilter.Enabled = false;
+        _categoryFilter.Enabled = false;
+        _itemPicker.Enabled = false;
+        _pickerAmount.Enabled = false;
+        _pickerMaxAmount.Enabled = false;
+        _pickerDamageFactor.Enabled = false;
+        _pickerApplyButton.Enabled = false;
+        UpdateToolbarActionEnabledState();
+    }
+
+    private void PopulateSortModeOptions()
+    {
+        _suppressSortModeEvents = true;
+        _sortModeCombo.BeginUpdate();
+        _sortModeCombo.Items.Clear();
+        _sortModeCombo.Items.Add(new SortModeOption { Mode = InventorySortMode.None, Label = UiStrings.Get("inventory.sort_none") });
+        _sortModeCombo.Items.Add(new SortModeOption { Mode = InventorySortMode.Name, Label = UiStrings.Get("inventory.sort_name") });
+        _sortModeCombo.Items.Add(new SortModeOption { Mode = InventorySortMode.Category, Label = UiStrings.Get("inventory.sort_category") });
+        _sortModeCombo.SelectedIndex = (int)_currentSortMode;
+        _sortModeCombo.EndUpdate();
+        _suppressSortModeEvents = false;
+    }
+
+    private void UpdateToolbarActionVisibility()
+    {
+        bool showSortControls = _sortingEnabled;
+        bool showAutoStackControl = _isCargoInventory && !_isStorageInventory
+            && (AutoStackToStorageRequested != null || AutoStackToStarshipRequested != null || AutoStackToFreighterRequested != null);
+
+        _sortModeLabel.Visible = showSortControls;
+        _sortModeCombo.Visible = showSortControls;
+        _autoStackToolStrip.Visible = showAutoStackControl;
+
+        _autoStackToChestsButtonMenuItem.Visible = AutoStackToStorageRequested != null;
+        _autoStackToStarshipButtonMenuItem.Visible = AutoStackToStarshipRequested != null;
+        _autoStackToFreighterButtonMenuItem.Visible = AutoStackToFreighterRequested != null;
+    }
+
+    private void UpdateToolbarActionEnabledState()
+    {
+        bool inventoryLoaded = _currentInventory != null;
+        _sortModeCombo.Enabled = _sortingEnabled && inventoryLoaded;
+        _autoStackToolStrip.Enabled = _isCargoInventory && !_isStorageInventory
+            && (AutoStackToStorageRequested != null || AutoStackToStarshipRequested != null || AutoStackToFreighterRequested != null)
+            && inventoryLoaded;
+
+        _autoStackToChestsButtonMenuItem.Enabled = AutoStackToStorageRequested != null && inventoryLoaded;
+        _autoStackToStarshipButtonMenuItem.Enabled = AutoStackToStarshipRequested != null && inventoryLoaded;
+        _autoStackToFreighterButtonMenuItem.Enabled = AutoStackToFreighterRequested != null && inventoryLoaded;
+    }
+
+    private void SetSortMode(InventorySortMode mode, bool applySort, bool raiseModified)
+    {
+        _currentSortMode = mode;
+
+        if (_sortModeCombo.SelectedIndex != (int)mode)
+        {
+            _suppressSortModeEvents = true;
+            _sortModeCombo.SelectedIndex = (int)mode;
+            _suppressSortModeEvents = false;
+        }
+
+        if (!applySort)
+            return;
+
+        ApplyCurrentSortMode(raiseModified);
+    }
+
+    private void ApplyCurrentSortMode(bool raiseModified)
+    {
+        switch (_currentSortMode)
+        {
+            case InventorySortMode.Name:
+                SortInventory(CompareByName, raiseModified);
+                break;
+            case InventorySortMode.Category:
+                SortInventory(CompareByCategory, raiseModified);
+                break;
+        }
+    }
+
+    private static int CompareByName(SlotSortEntry a, SlotSortEntry b)
+    {
+        int byName = string.Compare(a.SortName, b.SortName, StringComparison.OrdinalIgnoreCase);
+        if (byName != 0) return byName;
+        int byCategory = string.Compare(a.SortCategory, b.SortCategory, StringComparison.OrdinalIgnoreCase);
+        if (byCategory != 0) return byCategory;
+        return string.Compare(a.ItemId, b.ItemId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int CompareByCategory(SlotSortEntry a, SlotSortEntry b)
+    {
+        int byCategory = string.Compare(a.SortCategory, b.SortCategory, StringComparison.OrdinalIgnoreCase);
+        if (byCategory != 0) return byCategory;
+        int byName = string.Compare(a.SortName, b.SortName, StringComparison.OrdinalIgnoreCase);
+        if (byName != 0) return byName;
+        return string.Compare(a.ItemId, b.ItemId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Label CreateLabel(string text) =>
+        new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Padding = new Padding(0, 6, 6, 0) };
+
+    public void SetDatabase(GameItemDatabase? database)
+    {
+        _database = database;
+        _filtersPopulated = false; // Reset so filters repopulate on next LoadInventory
+        if (database != null)
+        {
+            _allItems = database.Items.Values
+                .Where(i => !GameItemDatabase.IsPickerExcluded(i.Id))
+                .ToList();
+            // Defer PopulateTypeFilter until LoadInventory - avoids adding ~4800
+            // items to three ComboBoxes for every InventoryGridPanel instance at
+            // startup when the panel hasn't been displayed yet. The call happens
+            // at the end of LoadInventory() which runs on first tab selection.
+        }
+    }
+
+    public void SetIconManager(IconManager? iconManager)
+    {
+        _iconManager = iconManager;
+    }
+
+    public JsonObject? GetLoadedInventory()
+    {
+        return _currentInventory;
+    }
+
+    private void PopulateTypeFilter()
+    {
+        _suppressFilterEvents = true;
+        _typeFilter.BeginUpdate();
+        _typeFilter.Items.Clear();
+        _typeFilter.Items.Add(UiStrings.Get("common.all_types"));
+
+        // Only include types that have at least one item passing the inventory
+        // filter (tech-only / cargo / owner-type restrictions).  This prevents
+        // showing irrelevant types (e.g. "Raw Materials" in a tech-only grid,
+        // or "Exocraft" in a freighter tech grid) that lead to empty category
+        // and item lists when selected.
+        var types = _allItems
+            .Where(CanAddItemToInventory)
+            .Select(i => i.ItemType)
+            .Where(t => !string.IsNullOrEmpty(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(t => t)
+            .Select(t => new TypeDisplayItem(t))
+            .ToArray();
+        _typeFilter.Items.AddRange(types);
+
+        _typeFilter.SelectedIndex = 0;
+        _typeFilter.EndUpdate();
+        _suppressFilterEvents = false;
+        UpdateCategoryFilter();
+    }
+
+    private void UpdateCategoryFilter()
+    {
+        _suppressFilterEvents = true;
+        _categoryFilter.BeginUpdate();
+        _categoryFilter.Items.Clear();
+        _categoryFilter.Items.Add(UiStrings.Get("common.all_categories"));
+
+        var filtered = GetTypeFilteredItems();
+        var categories = filtered
+            .Select(i => i.Category)
+            .Where(c => !string.IsNullOrEmpty(c))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(c => c)
+            .Select(c => new CategoryDisplayItem(c))
+            .ToArray();
+        _categoryFilter.Items.AddRange(categories);
+
+        _categoryFilter.SelectedIndex = 0;
+        _categoryFilter.EndUpdate();
+        _suppressFilterEvents = false;
+        UpdateItemPicker();
+    }
+
+    private void UpdateItemPicker()
+    {
+        _suppressFilterEvents = true;
+        _itemPicker.BeginUpdate();
+        _itemPicker.Items.Clear();
+        _itemPicker.Items.Add(UiStrings.Get("common.select_item"));
+
+        var items = GetFilteredItems().OrderBy(i => i.Name).ToArray();
+        _itemPicker.Items.AddRange(items);
+
+        // Auto-size the dropdown width to fit the longest item name so that
+        // long names are not cut off by the combobox field width.
+        int maxWidth = _itemPicker.Width;
+        using (var g = _itemPicker.CreateGraphics())
+        {
+            foreach (var obj in _itemPicker.Items)
+            {
+                int w = (int)g.MeasureString(obj.ToString() ?? "", _itemPicker.Font).Width
+                        + SystemInformation.VerticalScrollBarWidth + 4;
+                if (w > maxWidth) maxWidth = w;
+            }
+        }
+        _itemPicker.DropDownWidth = maxWidth;
+
+        _itemPicker.SelectedIndex = 0;
+        _itemPicker.EndUpdate();
+        _suppressFilterEvents = false;
+    }
+
+    private IEnumerable<GameItem> GetTypeFilteredItems()
+    {
+        var items = (IEnumerable<GameItem>)_allItems;
+
+        // Apply inventory type restrictions
+        items = items.Where(CanAddItemToInventory);
+
+        if (_typeFilter.SelectedIndex > 0)
+        {
+            string type;
+            if (_typeFilter.SelectedItem is TypeDisplayItem tdi)
+                type = tdi.InternalName;
+            else
+                type = _typeFilter.SelectedItem?.ToString() ?? "";
+            items = items.Where(i => i.ItemType.Equals(type, StringComparison.OrdinalIgnoreCase));
+        }
+        return items;
+    }
+
+    /// <summary>
+    /// Determines whether an item can be added to this inventory:
+    /// <list type="bullet">
+    ///   <item>Tech-only inventories only accept technology items matching OwnerEnums.</item>
+    ///   <item>Cargo inventories reject technology items entirely but accept all
+    ///     products and substances regardless of TechnologyCategory.</item>
+    ///   <item>General inventories accept all item types (tech items must match OwnerEnums).</item>
+    /// </list>
+    /// Also applies a filter to exclude maintenance-category technology items
+    /// and emotes.  Creature eggs are products and are not excluded.
+    /// </summary>
+    private bool CanAddItemToInventory(GameItem item)
+    {
+        if (!InventoryStackDatabase.CanAddItemToInventory(item, _isTechInventory, _isCargoInventory))
+            return false;
+
+        if (_isCargoInventory)
+            return true;
+
+        // For tech-only and general inventories, filter technology-related items by
+        // TechnologyCategory / owner. This prevents e.g. ship tech appearing in
+        // exosuit technology inventory. Only apply to technology-related items  - 
+        // substances and products use Category for grouping (Fuel, Metal, etc.)
+        // which is NOT a TechnologyCategory.
+        if (!string.IsNullOrEmpty(_inventoryOwnerType) &&
+            !string.IsNullOrEmpty(item.TechnologyCategory) &&
+            item.TechnologyCategory != "None" &&
+            GameItemDatabase.IsTechnologyRelatedType(item.ItemType))
+        {
+            if (!item.IsValidForOwner(_inventoryOwnerType))
+                return false;
+        }
+
+        return true;
+    }
+
+    private IEnumerable<GameItem> GetFilteredItems()
+    {
+        var items = GetTypeFilteredItems();
+        if (_categoryFilter.SelectedIndex > 0)
+        {
+            string cat;
+            if (_categoryFilter.SelectedItem is CategoryDisplayItem cdi)
+                cat = cdi.RawValue;
+            else
+                cat = _categoryFilter.SelectedItem?.ToString() ?? "";
+            items = items.Where(i => i.Category.Equals(cat, StringComparison.OrdinalIgnoreCase));
+        }
+        return items;
+    }
+
+    private void OnSearch(object? sender, EventArgs e)
+    {
+        string raw = _searchBox.Text.Trim();
+        if (string.IsNullOrEmpty(raw) || _database == null)
+        {
+            // Restore the full item list and refresh filters
+            if (_database != null)
+            {
+                _allItems = _database.Items.Values
+                    .Where(i => !GameItemDatabase.IsPickerExcluded(i.Id))
+                    .ToList();
+            }
+            PopulateTypeFilter();
+            return;
+        }
+
+        // Allow users to prefix a search with '^' (e.g. ^FUEL1) but strip it for the actual search.
+        // TrimStart supports multiple carets but that's harmless.
+        string query = raw.StartsWith("^", StringComparison.Ordinal) ? raw.TrimStart('^').Trim() : raw;
+
+        // If stripping the caret produced an empty query, restore full list
+        if (string.IsNullOrEmpty(query))
+        {
+            _allItems = _database.Items.Values
+                .Where(i => !GameItemDatabase.IsPickerExcluded(i.Id))
+                .ToList();
+            PopulateTypeFilter();
+            return;
+        }
+
+        _allItems = _database.Search(query)
+            .Where(i => !GameItemDatabase.IsPickerExcluded(i.Id))
+            .ToList();
+        PopulateTypeFilter();
+    }
+
+    private void OnTypeFilterChanged(object? sender, EventArgs e)
+    {
+        if (_suppressFilterEvents) return;
+        UpdateCategoryFilter();
+    }
+
+    private void OnCategoryFilterChanged(object? sender, EventArgs e)
+    {
+        if (_suppressFilterEvents) return;
+        UpdateItemPicker();
+    }
+
+    private void OnItemPickerChanged(object? sender, EventArgs e)
+    {
+        if (_suppressFilterEvents) return;
+        if (_itemPicker.SelectedItem is not GameItem selectedItem)
+        {
+            ClearPickerDetailPanel();
+            return;
+        }
+
+        // Populate picker detail fields with the selected item (independent of slot details)
+        _pickerItemId.Text = EnsureCaretPrefix(selectedItem.Id);
+        _pickerItemName.Text = selectedItem.Name;
+        _pickerDescription.Text = selectedItem.Description;
+
+        // Show/hide seed field and auto-generate a 5-digit seed for procedural items
+        UpdatePickerSeedFieldVisibility(selectedItem);
+
+        // Set icon
+        if (_iconManager != null && !string.IsNullOrEmpty(selectedItem.Icon))
+            _pickerIcon.Image = _iconManager.GetIcon(selectedItem.Icon);
+
+        // Set class mini icon from item quality/rarity
+        UpdatePickerClassIcon(selectedItem);
+
+        // Calculate per-item max amount using the inventory-group-aware formula:
+        // Substance -> 9999, Technology -> ChargeAmount always, Product -> multiplier x MaxStackSize
+        // Technology MaxAmount = ChargeAmount for ALL tech items (confirmed via game save + editor cross ref + MXML).
+        // Technology Amount = BuildFullyCharged ? ChargeAmount : 0 (fresh-insert default).
+        string invTypeForDefaults = ResolveInventoryTypeForItem(selectedItem);
+        int maxAmount = InventoryStackDatabase.GetMaxAmount(selectedItem, invTypeForDefaults, _inventoryGroup);
+        if (invTypeForDefaults == "Substance")
+        {
+            _pickerAmount.NumericValue = maxAmount;
+            _pickerMaxAmount.NumericValue = maxAmount;
+        }
+        else if (invTypeForDefaults == "Technology")
+        {
+            // Game behaviour (verified against MXML BuildFullyCharged field):
+            //   MaxAmount = ChargeAmount (always, for ALL tech: core, UT_, UP_, HDRIVEBOOST, etc.)
+            //   Amount (fresh insert) = BuildFullyCharged ? ChargeAmount : 0
+            // Examples: HYPERDRIVE -> 0/120 (BuildFC=false), UT_QUICKWARP -> 100/100 (BuildFC=true)
+            _pickerMaxAmount.NumericValue = maxAmount;
+            _pickerAmount.NumericValue = selectedItem.BuildFullyCharged ? maxAmount : 0;
+        }
+        else
+        {
+            // Products: default to full stack
+            _pickerAmount.NumericValue = maxAmount;
+            _pickerMaxAmount.NumericValue = maxAmount;
+        }
+        _pickerAmount.Enabled = true;
+        _pickerMaxAmount.Enabled = true;
+
+        UpdatePickerApplyButtonText();
+    }
+
+    private void EnableControlsAfterInventoryLoad()
+    {
+        // Enable controls after inventory is loaded
+        bool hideResize = _isStorageInventory && !_isChestInventory;
+        _resizeWidth.Enabled = !hideResize;
+        _resizeHeight.Enabled = !hideResize;
+        _resizeButton.Enabled = !hideResize;
+        _detailAmount.Enabled = true;
+        _detailMaxAmount.Enabled = true;
+        _detailDamageFactor.Enabled = true;
+        _applyButton.Enabled = false;
+        _searchButton.Enabled = true;
+        _typeFilter.Enabled = true;
+        _categoryFilter.Enabled = true;
+        _itemPicker.Enabled = true;
+        _pickerAmount.Enabled = true;
+        _pickerMaxAmount.Enabled = true;
+        _pickerDamageFactor.Enabled = true;
+        _pickerApplyButton.Enabled = false;
+        UpdateToolbarActionEnabledState();
+    }
+
+    public void LoadInventory(JsonObject? inventory)
+    {
+        // Freeze painting on the grid container to prevent visible intermediate
+        // redraws as cells are disposed and re-created.  Hiding the container
+        // is more thorough than SuspendLayout alone - it suppresses all paint
+        // messages, eliminating the visible "rebuild" glitch.
+        RedrawHelper.Suspend(_gridContainer);
+        SuspendLayout();
+        _gridContainer.SuspendLayout();
+
+        // Reset scroll position so the grid isn't offset after a rebuild
+        // (e.g. when switching languages while scrolled down).
+        _gridContainer.AutoScrollPosition = Point.Empty;
+
+        // Dispose old cells (ToolTips, bitmaps) before removing them
+        foreach (var cell in _cells)
+        {
+            _gridContainer.Controls.Remove(cell);
+            cell.Dispose();
+        }
+        _gridContainer.Controls.Clear();
+        _cells.Clear();
+        _selectedCell = null;
+        ClearDetailPanel();
+        _slots = null;
+        _currentInventory = inventory;
+
+        EnableControlsAfterInventoryLoad();
+
+        if (inventory == null)
+        {
+            UpdateToolbarActionEnabledState();
+            _gridContainer.ResumeLayout(false);
+            ResumeLayout(true);
+            RedrawHelper.Resume(_gridContainer);
+            return;
+        }
+        _slots = inventory.GetArray("Slots");
+        if (_slots == null)
+        {
+            UpdateToolbarActionEnabledState();
+            _gridContainer.ResumeLayout(false);
+            ResumeLayout(true);
+            RedrawHelper.Resume(_gridContainer);
+            return;
+        }
+
+        // Determine grid dimensions from inventory Width/Height fields
+        int width = GridColumns;
+        int height = 1;
+        try
+        {
+            int invWidth = 0, invHeight = 0;
+            try { invWidth = inventory.GetInt("Width"); } catch { }
+            try { invHeight = inventory.GetInt("Height"); } catch { }
+            if (invWidth > 0 && invHeight > 0)
+            {
+                width = invWidth;
+                height = invHeight;
+            }
+            else
+            {
+                // Fallback: infer from ValidSlotIndices + Slots
+                var validSlots = inventory.GetArray("ValidSlotIndices");
+                int maxX = 0, maxY = 0;
+                if (validSlots != null)
+                {
+                    for (int i = 0; i < validSlots.Length; i++)
+                    {
+                        var idx = validSlots.GetObject(i);
+                        if (idx != null)
+                        {
+                            try { maxX = Math.Max(maxX, idx.GetInt("X")); } catch { }
+                            try { maxY = Math.Max(maxY, idx.GetInt("Y")); } catch { }
+                        }
+                    }
+                }
+                // Also check Slots for items beyond ValidSlotIndices
+                for (int i = 0; i < _slots.Length; i++)
+                {
+                    try
+                    {
+                        var slot = _slots.GetObject(i);
+                        var si = slot?.GetObject("Index");
+                        if (si != null)
+                        {
+                            maxX = Math.Max(maxX, si.GetInt("X"));
+                            maxY = Math.Max(maxY, si.GetInt("Y"));
+                        }
+                    }
+                    catch { }
+                }
+                if (maxX > 0 || maxY > 0)
+                {
+                    width = maxX + 1;
+                    height = maxY + 1;
+                }
+                else
+                {
+                    height = (_slots.Length + width - 1) / width;
+                }
+            }
+            // Set NUDs to current inventory dimensions
+            _resizeWidth.NumericValue = Math.Clamp(width, (int)(_resizeWidth.Minimum ?? 1), (int)(_resizeWidth.Maximum ?? 20));
+            _resizeHeight.NumericValue = Math.Clamp(height, (int)(_resizeHeight.Minimum ?? 1), (int)(_resizeHeight.Maximum ?? 20));
+            bool hideResize = _isStorageInventory && !_isChestInventory;
+            _resizeWidthLabel.Visible = !hideResize;
+            _resizeHeightLabel.Visible = !hideResize;
+            _resizeWidth.Visible = !hideResize;
+            _resizeHeight.Visible = !hideResize;
+            _resizeButton.Visible = !hideResize;
+            _resizeWidthLabel.Enabled = !hideResize;
+            _resizeHeightLabel.Enabled = !hideResize;
+            _resizeWidth.Enabled = !hideResize;
+            _resizeHeight.Enabled = !hideResize;
+            _resizeButton.Enabled = !hideResize;
+            // Chest inventories support up to 10x12 (120 slots)
+            if (_isChestInventory)
+            {
+                _resizeWidth.Maximum = 10;
+                _resizeHeight.Maximum = 12;
+            }
+        }
+        catch { }
+
+        // Build slot lookup by X,Y position
+        var slotMap = new Dictionary<(int x, int y), (int index, JsonObject slot)>();
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            try
+            {
+                var slot = _slots.GetObject(i);
+                int x = 0, y = 0;
+                try
+                {
+                    var idx = slot.GetObject("Index");
+                    if (idx != null)
+                    {
+                        x = idx.GetInt("X");
+                        y = idx.GetInt("Y");
+                    }
+                }
+                catch { x = i % width; y = i / width; }
+                slotMap[(x, y)] = (i, slot);
+            }
+            catch { }
+        }
+
+        // Build valid slot set
+        var validSet = new HashSet<(int, int)>();
+        try
+        {
+            var validSlots = inventory.GetArray("ValidSlotIndices");
+            if (validSlots != null)
+            {
+                for (int i = 0; i < validSlots.Length; i++)
+                {
+                    var idx = validSlots.GetObject(i);
+                    if (idx != null)
+                    {
+                        try { validSet.Add((idx.GetInt("X"), idx.GetInt("Y"))); } catch { }
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // Create grid cells (layout already suspended from method start)
+        // Collect all cells and batch-add via AddRange to avoid per-cell overhead
+        var cellsToAdd = new Control[width * height];
+        int cellIdx = 0;
+        for (int r = 0; r < height; r++)
+        {
+            for (int col = 0; col < width; col++)
+            {
+                var cell = new SlotCell(col, r, CellWidth, CellHeight, _sharedToolTip);
+                cell.ApplyPalette(_currentPalette);
+                cell.IsInTechInventory = _isTechInventory;
+                cell.Location = new Point(
+                    col * (CellWidth + CellPadding) + CellPadding,
+                    r * (CellHeight + CellPadding) + CellPadding
+                );
+                cell.ShowPinToggle = _pinSlotFeatureEnabled;
+
+                if (slotMap.TryGetValue((col, r), out var slotData))
+                {
+                    cell.SlotIndex = slotData.index;
+                    cell.SlotData = slotData.slot;
+                    LoadCellData(cell);
+                }
+                else if (validSet.Contains((col, r)) || validSet.Count == 0)
+                {
+                    // Valid slot but empty - can add items here
+                    cell.IsValidEmpty = true;
+                    cell.IsActivated = true; // In ValidSlotIndices = enabled
+                    cell.IsSupercharged = IsSlotSupercharged(col, r);
+                    cell.IsPinnedForAutoStack = IsPinnedSlot(col, r);
+                    cell.UpdateDisplay();
+                }
+                else
+                {
+                    // Not in ValidSlotIndices and no data = disabled slot
+                    cell.IsEmpty = true;
+                    cell.IsActivated = false;
+                    cell.IsPinnedForAutoStack = false;
+                    cell.UpdateDisplay();
+                }
+
+                cell.Click += OnCellClicked;
+                cell.PinToggleClicked += OnCellPinToggleClicked;
+                AttachRightClickHandler(cell);
+                AttachDragHandlers(cell);
+                cellsToAdd[cellIdx++] = cell;
+                _cells.Add(cell);
+            }
+        }
+        _gridContainer.Controls.AddRange(cellsToAdd);
+
+        _gridContainer.ResumeLayout(false);
+
+        // Compute adjacency highlighting for tech items
+        ComputeAdjacency(width, height);
+
+        // Populate type/category/item filter ComboBoxes once per database.
+        // _allItems is already built by SetDatabase, so we only need to
+        // populate the filter controls on the first LoadInventory call.
+        if (_database != null && !_filtersPopulated)
+        {
+            _filtersPopulated = true;
+            PopulateTypeFilter();
+        }
+
+        // Resume the outer layout that was suspended at the start of this method,
+        // then re-enable painting for one flicker-free repaint of the whole grid.
+        ResumeLayout(true);
+        RedrawHelper.Resume(_gridContainer);
+        UpdateToolbarActionEnabledState();
+
+        // Reset sort mode to None on every load so sorting is never "sticky".
+        // The user must explicitly select a sort option from the dropdown each time.
+        if (_sortingEnabled && _currentSortMode != InventorySortMode.None && !_isApplyingSort)
+            SetSortMode(InventorySortMode.None, applySort: false, raiseModified: false);
+    }
+
+    /// <summary>
+    /// Convert a BinaryData item ID to its display string form,
+    /// Binary format: ^(hex-encoded-bytes)#(variant-digits)
+    /// </summary>
+    private static string BinaryDataToItemId(BinaryData data)
+    {
+        var bytes = data.ToByteArray();
+        var sb = new System.Text.StringBuilder();
+        bool afterHash = false;
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            int b = bytes[i] & 0xFF;
+            if (i == 0)
+            {
+                if (b != 0x5E) // '^'
+                    return data.ToString();
+                sb.Append('^');
+            }
+            else if (b == 0x23) // '#'
+            {
+                sb.Append('#');
+                afterHash = true;
+            }
+            else if (afterHash)
+            {
+                sb.Append((char)b);
+            }
+            else
+            {
+                const string hexChars = "0123456789ABCDEF";
+                sb.Append(hexChars[(b >> 4) & 0xF]);
+                sb.Append(hexChars[b & 0xF]);
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Extract an item ID string from a raw value that may be a string or BinaryData.
+    /// </summary>
+    private static string ExtractItemId(object? rawId)
+    {
+        if (rawId is JsonObject idObject)
+            rawId = idObject.Get("Id");
+
+        if (rawId is BinaryData binData)
+            return BinaryDataToItemId(binData);
+        return rawId as string ?? "";
+    }
+
+    /// <summary>
+    /// Extract the binary body bytes (between '^' and '#') from a <see cref="BinaryData"/> item ID.
+    /// Returns <c>null</c> when the data does not start with '^'.
+    /// </summary>
+    private static byte[]? ExtractBinaryIdBody(BinaryData data)
+    {
+        var raw = data.ToByteArray();
+        if (raw.Length == 0 || raw[0] != 0x5E) return null; // '^'
+        int hashIndex = Array.IndexOf(raw, (byte)0x23, 1); // '#'
+        int bodyEnd = hashIndex >= 0 ? hashIndex : raw.Length;
+        var body = new byte[bodyEnd - 1];
+        Array.Copy(raw, 1, body, 0, body.Length);
+        return body;
+    }
+
+    /// <summary>
+    /// Reconstruct a <see cref="BinaryData"/> item ID from known binary body bytes
+    /// and a display ID that may contain a new seed suffix.
+    /// Returns the display string unchanged when <paramref name="binaryBody"/> is <c>null</c>.
+    /// </summary>
+    internal static object BuildBinaryIdValue(string displayId, byte[]? binaryBody)
+    {
+        if (binaryBody == null)
+            return displayId;
+
+        int hashPos = displayId.IndexOf('#', 1);
+        string suffix = hashPos >= 0 ? displayId.Substring(hashPos) : "";
+
+        var bytes = new byte[1 + binaryBody.Length + suffix.Length];
+        bytes[0] = 0x5E; // '^'
+        Array.Copy(binaryBody, 0, bytes, 1, binaryBody.Length);
+        for (int i = 0; i < suffix.Length; i++)
+            bytes[1 + binaryBody.Length + i] = (byte)suffix[i];
+
+        return new BinaryData(bytes);
+    }
+
+    /// <summary>
+    /// Ensure an item ID has the required '^' prefix for the NMS save format.
+    /// All item IDs in the save file are prefixed with '^' (e.g. "^EYEBALL", "^FUEL1").
+    /// Empty/cleared slots use just "^".
+    /// </summary>
+    private static string EnsureCaretPrefix(string itemId)
+    {
+        if (string.IsNullOrEmpty(itemId))
+            return "^";
+        if (itemId.StartsWith("^", StringComparison.Ordinal))
+            return itemId;
+        return "^" + itemId;
+    }
+
+    /// <summary>
+    /// Generates a 5-digit procedural seed string (00000-99999), matching the format
+    /// used by the game and other save editors. Returns only the numeric portion.
+    /// </summary>
+    internal static string GenerateProceduralSeed() => ProceduralSeedHelper.Generate();
+
+    /// <summary>
+    /// Splits an item ID into its base ID and optional procedural seed.
+    /// Example: "^UP_LAUNX#91934" returns ("^UP_LAUNX", "91934").
+    /// If no seed is present, the seed portion is empty.
+    /// </summary>
+    internal static (string baseId, string seed) StripProceduralSeed(string itemId) => ProceduralSeedHelper.Strip(itemId);
+
+    /// <summary>
+    /// Returns true for figurine/bobblehead items that need T_ prefix when installed.
+    /// In the save file, installed figurines use "^T_BOBBLE_*" IDs (Technology)
+    /// while the product form is "^BOBBLE_*".
+    /// </summary>
+    private static bool IsFigurineItem(string itemId)
+    {
+        string stripped = itemId.TrimStart('^');
+        // Already has T_ prefix (e.g. from save data) - not a bare figurine ID
+        if (stripped.StartsWith("T_", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return stripped.StartsWith("BOBBLE_", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Shows or hides the procedural seed field based on whether the given item is procedural.
+    /// When shown and <paramref name="seed"/> is empty, auto-generates a 5-digit seed.
+    /// </summary>
+    private void UpdateSeedFieldVisibility(GameItem? gameItem, string seed = "")
+    {
+        bool isProcedural = gameItem != null && gameItem.IsProcedural;
+        _detailSeedLabel.Visible = isProcedural;
+        _detailSeedField.Visible = isProcedural;
+        _detailGenSeedButton.Visible = isProcedural;
+        if (isProcedural)
+        {
+            _detailSeedField.Text = string.IsNullOrEmpty(seed)
+                ? GenerateProceduralSeed()
+                : seed;
+        }
+        else
+        {
+            _detailSeedField.Text = "";
+        }
+    }
+
+    /// <summary>
+    /// Generates a new random procedural seed and places it into the seed text field.
+    /// </summary>
+    private void OnGenSeedClick(object? sender, EventArgs e)
+    {
+        _detailSeedField.Text = GenerateProceduralSeed();
+    }
+
+    /// <summary>
+    /// Shows or hides the picker procedural seed field based on whether the given item is procedural.
+    /// When shown and seed is empty, auto-generates a 5-digit seed.
+    /// </summary>
+    private void UpdatePickerSeedFieldVisibility(GameItem? gameItem, string seed = "")
+    {
+        bool isProcedural = gameItem != null && gameItem.IsProcedural;
+        _pickerSeedLabel.Visible = isProcedural;
+        _pickerSeedField.Visible = isProcedural;
+        _pickerGenSeedButton.Visible = isProcedural;
+        if (isProcedural)
+        {
+            _pickerSeedField.Text = string.IsNullOrEmpty(seed)
+                ? GenerateProceduralSeed()
+                : seed;
+        }
+        else
+        {
+            _pickerSeedField.Text = "";
+        }
+    }
+
+    /// <summary>
+    /// Generates a new random procedural seed for the picker seed text field.
+    /// </summary>
+    private void OnPickerGenSeedClick(object? sender, EventArgs e)
+    {
+        _pickerSeedField.Text = GenerateProceduralSeed();
+    }
+
+    /// <summary>
+    /// Resolves the class mini icon for a game item and displays it in the picker class icon control.
+    /// Uses the same Quality/Rarity logic that drives the grid cell class overlay.
+    /// </summary>
+    private void UpdatePickerClassIcon(GameItem selectedItem)
+    {
+        if (_iconManager == null)
+        {
+            _pickerClassIcon.Image = null;
+            return;
+        }
+
+        string? itemClass = selectedItem.QualityToClass() ?? selectedItem.RarityToClass();
+        if (!string.IsNullOrEmpty(itemClass) && itemClass != "NONE"
+            && ShouldShowClassMiniIcon(selectedItem.ItemType, selectedItem.Id))
+        {
+            if (itemClass == "?") itemClass = "Sentinel";
+            _pickerClassIcon.Image = _iconManager.GetIcon($"CLASSMINI.{itemClass}.png");
+        }
+        else
+        {
+            _pickerClassIcon.Image = null;
+        }
+    }
+
+    /// <summary>
+    /// Combines the base item ID with a procedural seed (if applicable) to form the save-file ID.
+    /// Strips any existing seed from <paramref name="baseId"/> first to prevent double-seeding.
+    /// </summary>
+    private string BuildSaveItemId(string baseId, GameItem? gameItem)
+    {
+        // Always strip any seed that may already be in the base ID
+        var (cleanId, _) = StripProceduralSeed(baseId);
+        string result = EnsureCaretPrefix(cleanId);
+
+        if (gameItem != null && gameItem.IsProcedural)
+        {
+            string seedText = _detailSeedField.Text.Trim();
+            if (!ProceduralSeedHelper.IsValidSeed(seedText))
+                seedText = GenerateProceduralSeed();
+            result = $"{result}#{seedText}";
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds a save item ID using the picker seed field instead of the detail seed field.
+    /// </summary>
+    private string BuildPickerSaveItemId(string baseId, GameItem? gameItem)
+    {
+        var (cleanId, _) = StripProceduralSeed(baseId);
+        string result = EnsureCaretPrefix(cleanId);
+
+        if (gameItem != null && gameItem.IsProcedural)
+        {
+            string seedText = _pickerSeedField.Text.Trim();
+            if (!ProceduralSeedHelper.IsValidSeed(seedText))
+                seedText = GenerateProceduralSeed();
+            result = $"{result}#{seedText}";
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Maps the database ItemType (derived from JSON file names) to the NMS save InventoryType value.
+    /// Database ItemTypes are file names like "Technology", "Raw Materials", "Upgrades", "Curiosities".
+    /// Save InventoryType must be one of: "Substance", "Product", or "Technology".
+    /// </summary>
+    private static string ResolveInventoryType(string? itemType)
+        => InventoryStackDatabase.ResolveInventoryType(itemType);
+
+    /// <summary>
+    /// Resolves the save-file InventoryType for a specific game item,
+    /// using <c>IsProcedural</c> to correctly classify procedural tech modules.
+    /// </summary>
+    private string ResolveInventoryTypeForItem(GameItem item)
+        => InventoryStackDatabase.ResolveInventoryTypeForItem(item, _isTechInventory);
+
+    /// <summary>
+    /// Resolves the save-file InventoryType accounting for the target inventory.
+    /// </summary>
+    private string ResolveSaveInventoryType(string? itemType)
+        => InventoryStackDatabase.ResolveSaveInventoryType(itemType, _isTechInventory);
+
+    /// <summary>
+    /// Compute adjacency highlighting for all cells in the grid.
+    /// Items with the same BaseStatType that are cardinally adjacent
+    /// get a colored border using the canonical colour for that BaseStatType group.
+    /// </summary>
+    private void ComputeAdjacency(int gridWidth, int gridHeight)
+    {
+        // Build a quick lookup: (x, y) -> cell
+        var grid = new Dictionary<(int, int), SlotCell>();
+        foreach (var cell in _cells)
+        {
+            if (!string.IsNullOrEmpty(cell.ItemId))
+                grid[(cell.GridX, cell.GridY)] = cell;
+        }
+
+        // For each cell, check cardinal neighbors
+        foreach (var cell in _cells)
+        {
+            cell.ShowAdjacencyBorder = false;
+            cell.AdjacencyBorderColor = Color.Transparent;
+
+            if (string.IsNullOrEmpty(cell.ItemId)) continue;
+
+            var info = TechAdjacencyDatabase.GetAdjacencyInfo(cell.ItemId);
+            if (info == null || info.BaseStatType == 0) continue;
+
+            // Check 4 cardinal neighbors
+            var neighbors = new[] { (cell.GridX - 1, cell.GridY), (cell.GridX + 1, cell.GridY),
+                                    (cell.GridX, cell.GridY - 1), (cell.GridX, cell.GridY + 1) };
+
+            foreach (var (nx, ny) in neighbors)
+            {
+                if (!grid.TryGetValue((nx, ny), out var neighbor)) continue;
+                var nInfo = TechAdjacencyDatabase.GetAdjacencyInfo(neighbor.ItemId);
+                if (nInfo != null && nInfo.BaseStatType == info.BaseStatType)
+                {
+                    cell.ShowAdjacencyBorder = true;
+                    try
+                    {
+                        cell.AdjacencyBorderColor = ColorTranslator.FromHtml(
+                            TechAdjacencyDatabase.GetBaseStatTypeColour(info.BaseStatType));
+                    }
+                    catch
+                    {
+                        cell.AdjacencyBorderColor = Color.Yellow;
+                    }
+                    break;
+                }
+            }
+
+            if (cell.ShowAdjacencyBorder)
+                cell.UpdateBorderOverlay();
+        }
+    }
+
+    private void LoadCellData(SlotCell cell)
+    {
+        if (cell.SlotData == null) return;
+
+        string itemId = "";
+        byte[]? binaryBody = null;
+        try
+        {
+            object? rawId;
+            var idObj = cell.SlotData.GetObject("Id");
+            rawId = idObj != null ? idObj.Get("Id") : cell.SlotData.Get("Id");
+
+            if (rawId is BinaryData binData)
+            {
+                itemId = BinaryDataToItemId(binData);
+                binaryBody = ExtractBinaryIdBody(binData);
+            }
+            else
+            {
+                itemId = rawId as string ?? "";
+            }
+        }
+        catch { }
+
+        cell.ItemId = itemId;
+        cell.OriginalBinaryIdBody = binaryBody;
+
+        int amount = 0, maxAmount = 0;
+        double damageFactor = 0;
+        try { amount = cell.SlotData.GetInt("Amount"); } catch { }
+        try { maxAmount = cell.SlotData.GetInt("MaxAmount"); } catch { }
+        try { damageFactor = cell.SlotData.GetDouble("DamageFactor"); } catch { }
+        cell.Amount = amount;
+        cell.MaxAmount = maxAmount;
+        cell.DamageFactor = damageFactor;
+
+        // Check activation status (whether position is in ValidSlotIndices)
+        cell.IsActivated = IsSlotInValidIndices(cell.GridX, cell.GridY);
+        cell.ShowPinToggle = _pinSlotFeatureEnabled && cell.IsActivated;
+        cell.IsPinnedForAutoStack = cell.IsActivated && IsPinnedSlot(cell.GridX, cell.GridY);
+
+        // Check supercharged status (SpecialSlots entry with matching X,Y and TechBonus type)
+        cell.IsSupercharged = IsSlotSupercharged(cell.GridX, cell.GridY);
+
+        // Check if slot has an actual item or is empty-with-position
+        if (string.IsNullOrEmpty(itemId) || itemId == "^" || itemId == "^YOURSLOTITEM")
+        {
+            cell.IsValidEmpty = true;
+            cell.SlotData = cell.SlotData; // Keep slot data for position
+            cell.UpdateDisplay();
+            return;
+        }
+
+        // Look up display name and type from database, handling variant IDs like ^UP_JETX#76842
+        if (_database != null && !string.IsNullOrEmpty(itemId))
+        {
+            var (gameItem, displayName, techPackIcon, techPackClass) = ResolveItemAndDisplayName(itemId);
+            if (gameItem != null)
+            {
+                cell.DisplayName = displayName;
+                cell.ItemType = gameItem.ItemType;
+                cell.Category = gameItem.Category;
+                cell.IsChargeable = gameItem.IsChargeable;
+
+                // Set item class from TechPack if available, else from Quality field, else from Rarity
+                if (!string.IsNullOrEmpty(techPackClass))
+                    cell.ItemClass = techPackClass;
+                else if (!string.IsNullOrEmpty(gameItem.Quality))
+                {
+                    var qClass = gameItem.QualityToClass();
+                    if (!string.IsNullOrEmpty(qClass))
+                        cell.ItemClass = qClass;
+                }
+
+                // Fallback: derive class from Rarity for upgrades (U_, SHIP_) where Quality is absent
+                if (string.IsNullOrEmpty(cell.ItemClass) && !string.IsNullOrEmpty(gameItem.Rarity))
+                {
+                    var rClass = gameItem.RarityToClass();
+                    if (!string.IsNullOrEmpty(rClass))
+                        cell.ItemClass = rClass;
+                }
+
+                // Use TechPack icon when the item was resolved via TechPacks, otherwise use the game item icon
+                string iconName = techPackIcon ?? gameItem.Icon;
+
+                // For CV_ corvette tech items, try to guess the actual base part from the corvette's Objects.
+                // Use cached corvette override when available (preserved across drag/drop moves).
+                if (_corvettePartCollection != null && IsCorvetteTechId(itemId))
+                {
+                    // Both CorvetteDisplayName and CorvetteIconName are always set/cleared together.
+                    if (cell.CorvetteDisplayName != null && cell.CorvetteIconName != null)
+                    {
+                        // Reuse cached corvette resolution from a previous LoadCellData
+                        iconName = cell.CorvetteIconName;
+                        cell.DisplayName = cell.CorvetteDisplayName;
+                    }
+                    else
+                    {
+                        var basePart = GuessCorvetteBasePart(itemId);
+                        if (basePart != null)
+                        {
+                            // Override icon and name with the actual base part's info
+                            iconName = basePart.Icon;
+                            string variant = "";
+                            var vm = Regex.Match(itemId, @"#\d{5,}$");
+                            if (vm.Success) variant = vm.Value;
+                            cell.DisplayName = string.IsNullOrEmpty(variant) ? basePart.Name : $"{basePart.Name} [{variant}]";
+
+                            // Cache for drag/drop preservation
+                            cell.CorvetteDisplayName = cell.DisplayName;
+                            cell.CorvetteIconName = iconName;
+                        }
+                    }
+                }
+
+                if (_iconManager != null && !string.IsNullOrEmpty(iconName))
+                    cell.IconImage = _iconManager.GetIcon(iconName);
+
+                // Load class mini icon overlay only for Technology, Technology Module, and Upgrades types
+                if (_iconManager != null && !string.IsNullOrEmpty(cell.ItemClass) && cell.ItemClass != "NONE"
+                    && ShouldShowClassMiniIcon(gameItem.ItemType, itemId))
+                {
+                    if(cell.ItemClass == "?") cell.ItemClass = "Sentinel";
+                    cell.ClassMiniIcon = _iconManager.GetIcon($"CLASSMINI.{cell.ItemClass}.png");
+                }
+                    
+            }
+            else
+            {
+                // Fallback: show raw ID (with variant appended)
+                cell.DisplayName = displayNameFromId(itemId);
+            }
+        }
+
+        cell.UpdateDisplay();
+    }
+
+    /// <summary>
+    /// Returns true when the item type and ID indicate that a class mini icon
+    /// should be displayed. Only Technology, Technology Module, and Upgrades
+    /// items are eligible, and Upgrades whose IDs end with "INV_TOKEN" are excluded.
+    /// </summary>
+    private static bool ShouldShowClassMiniIcon(string itemType, string itemId)
+    {
+        if (string.IsNullOrEmpty(itemType))
+            return false;
+        if (itemType.Equals("Technology", StringComparison.OrdinalIgnoreCase)
+            || itemType.Equals("Technology Module", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (itemType.Equals("Upgrades", StringComparison.OrdinalIgnoreCase))
+        {
+            // Exclude inventory token items (e.g. WEAP_INV_TOKEN, SUIT_INV_TOKEN)
+            string baseId = itemId.StartsWith("^", StringComparison.Ordinal) ? itemId[1..] : itemId;
+            if (baseId.EndsWith("INV_TOKEN", StringComparison.OrdinalIgnoreCase))
+                return false;
+            return true;
+        }
+        return false;
+    }
+
+    // Helper: build a simple display when no DB entry exists
+    private static string displayNameFromId(string id)
+    {
+        var m = Regex.Match(id, @"#\d{5,}$");
+        if (m.Success)
+        {
+            var baseId = id.Substring(0, m.Index);
+            var variant = m.Value;
+            return baseId + " [" + variant + "]";
+        }
+        return id;
+    }
+
+    /// <summary>
+    /// Checks whether the given ID (without any #variant suffix) is a TechPack hash.
+    /// TechPack hashes are a '^' prefix followed by exactly 12 uppercase hex characters.
+    /// </summary>
+    private static bool IsTechPackHash(string baseId) =>
+        baseId.Length == 13 && baseId[0] == '^' && Regex.IsMatch(baseId, @"^\^[0-9A-Fa-f]{12}$");
+
+    /// <summary>
+    /// Resolves a GameItem from an item ID, checking the TechPacks dictionary as a fallback
+    /// for hash-based IDs (^+12 hex chars, with optional #variant suffix).
+    /// Returns the resolved GameItem and, when the item was resolved via TechPacks, the TechPack icon filename.
+    /// </summary>
+    private (GameItem? gameItem, string? techPackIcon, string? techPackClass) ResolveGameItem(string itemId)
+    {
+        if (_database == null) return (null, null, null);
+
+        // Detect variant suffix (#12345)
+        var m = Regex.Match(itemId, @"#\d{5,}$");
+        string baseId = itemId;
+        if (m.Success)
+            baseId = itemId.Substring(0, m.Index);
+
+        // Try direct database lookup first
+        GameItem? gi = _database.GetItem(itemId) ?? _database.GetItem("^" + itemId);
+        if (gi == null && m.Success)
+            gi = _database.GetItem(baseId) ?? _database.GetItem("^" + baseId);
+
+        if (gi != null)
+        {
+            // Item found directly - check TechPack for class info by item ID
+            var cls = TechPacks.GetClassById(baseId);
+            return (gi, null, cls);
+        }
+
+        // Fallback: check TechPacks for hash-based IDs
+        if (IsTechPackHash(baseId) && TechPacks.Dictionary.TryGetValue(baseId, out var techPack))
+        {
+            gi = _database.GetItem(techPack.Id);
+            if (gi != null)
+                return (gi, techPack.Icon, techPack.Class);
+        }
+
+        return (null, null, null);
+    }
+
+    /// <summary>
+    /// Resolve a GameItem and a display name for an item id that may include a variant suffix.
+    /// Variant format recognized: '#'+5+digits at the end (e.g. ^UP_JETX#76842).
+    /// Lookup tries the exact id first, then falls back to the base id (without the #digits),
+    /// and finally checks TechPacks for hash-based IDs.
+    /// The returned display name uses the base GameItem.Name with " [#digits]" appended when a variant is present.
+    /// Also returns a TechPack icon filename override when the item was resolved via TechPacks.
+    /// </summary>
+    private (GameItem? gameItem, string displayName, string? techPackIcon, string? techPackClass) ResolveItemAndDisplayName(string itemId)
+    {
+        if (_database == null) return (null, displayNameFromId(itemId), null, null);
+
+        // Detect variant suffix (#12345)
+        var m = Regex.Match(itemId, @"#\d{5,}$");
+        string baseId = itemId;
+        string variant = "";
+        if (m.Success)
+        {
+            variant = m.Value; // includes the leading '#'
+            baseId = itemId.Substring(0, m.Index);
+        }
+
+        var (gi, techPackIcon, techPackClass) = ResolveGameItem(itemId);
+
+        // For tech inventories, prefer NameLower over Name
+        string displayBase;
+        if (_isTechInventory && gi != null && !string.IsNullOrEmpty(gi.NameLower))
+            displayBase = gi.NameLower;
+        else
+            displayBase = gi?.Name ?? baseId;
+        string displayName = string.IsNullOrEmpty(variant) ? displayBase : $"{displayBase} [{variant}]";
+        return (gi, displayName, techPackIcon, techPackClass);
+    }
+
+    private bool IsSlotInValidIndices(int x, int y)
+    {
+        if (_currentInventory == null) return false;
+        try
+        {
+            var validSlots = _currentInventory.GetArray("ValidSlotIndices");
+            if (validSlots == null) return false;
+            for (int i = 0; i < validSlots.Length; i++)
+            {
+                var idx = validSlots.GetObject(i);
+                if (idx != null && idx.GetInt("X") == x && idx.GetInt("Y") == y)
+                    return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    private bool IsSlotSupercharged(int x, int y)
+    {
+        if (_currentInventory == null) return false;
+        try
+        {
+            var specialSlots = _currentInventory.GetArray("SpecialSlots");
+            if (specialSlots == null) return false;
+            for (int i = 0; i < specialSlots.Length; i++)
+            {
+                var entry = specialSlots.GetObject(i);
+                if (entry == null) continue;
+                var typeObj = entry.GetObject("Type");
+                if (typeObj == null) continue;
+                string slotType = typeObj.GetString("InventorySpecialSlotType") ?? "";
+                if (slotType != "TechBonus") continue;
+                var idxObj = entry.GetObject("Index");
+                if (idxObj == null) continue;
+                if (idxObj.GetInt("X") == x && idxObj.GetInt("Y") == y)
+                    return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    private int CountSuperchargedSlots()
+    {
+        if (_currentInventory == null) return 0;
+        int count = 0;
+        try
+        {
+            var specialSlots = _currentInventory.GetArray("SpecialSlots");
+            if (specialSlots == null) return 0;
+            for (int i = 0; i < specialSlots.Length; i++)
+            {
+                var entry = specialSlots.GetObject(i);
+                if (entry == null) continue;
+                var typeObj = entry.GetObject("Type");
+                if (typeObj == null) continue;
+                string slotType = typeObj.GetString("InventorySpecialSlotType") ?? "";
+                if (slotType == "TechBonus") count++;
+            }
+        }
+        catch { }
+        return count;
+    }
+
+    private void OnCellClicked(object? sender, EventArgs e)
+    {
+        if (sender is not SlotCell cell) return;
+        SelectCell(cell);
+    }
+
+    /// <summary>
+    /// Attach explicit MouseUp handlers to a cell so that right-click reliably
+    /// shows the context menu.  Because SlotCell is now owner-drawn with no
+    /// child controls, we only need to attach to the cell itself.
+    /// </summary>
+    private void AttachRightClickHandler(SlotCell cell)
+    {
+        void Handler(object? s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Right) return;
+            _contextCell = cell;
+            ConfigureContextMenuItems(cell);
+            var screenPoint = (s as Control)?.PointToScreen(e.Location) ?? Cursor.Position;
+            _cellContextMenu.Show(screenPoint);
+        }
+
+        cell.MouseUp += Handler;
+    }
+
+    /// <summary>
+    /// Attach mouse handlers to a cell to support drag-and-drop of items
+    /// between inventory slots.  Because SlotCell is now owner-drawn with no
+    /// child controls, we only need to attach to the cell itself.
+    /// Left-click + drag moves/swaps items; Ctrl + drag duplicates to empty slots.
+    /// </summary>
+    private void AttachDragHandlers(SlotCell cell)
+    {
+        void OnMouseDown(object? s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            // Only start a potential drag from a cell that has an item
+            if (cell.SlotData == null || string.IsNullOrEmpty(cell.ItemId) || cell.IsValidEmpty) return;
+            _dragSourceCell = cell;
+            _dragStartPoint = (s as Control)?.PointToScreen(e.Location) ?? Cursor.Position;
+            _isDragging = false;
+        }
+
+        void OnMouseMove(object? s, MouseEventArgs e)
+        {
+            if (_dragSourceCell == null || _dragSourceCell != cell) return;
+            if (e.Button != MouseButtons.Left)
+            {
+                // Mouse button released elsewhere, cancel potential drag
+                CancelDrag();
+                return;
+            }
+
+            var currentScreen = (s as Control)?.PointToScreen(e.Location) ?? Cursor.Position;
+            if (!_isDragging)
+            {
+                // Check if mouse has moved past drag threshold
+                int dx = Math.Abs(currentScreen.X - _dragStartPoint.X);
+                int dy = Math.Abs(currentScreen.Y - _dragStartPoint.Y);
+                if (dx > DragThreshold || dy > DragThreshold)
+                {
+                    _isDragging = true;
+                    Cursor = Cursors.Hand;
+                }
+            }
+
+            if (_isDragging)
+            {
+                // Highlight potential drop target
+                var target = GetCellAtScreenPoint(currentScreen);
+                UpdateDragHighlight(target);
+            }
+        }
+
+        void OnMouseUp(object? s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || _dragSourceCell == null)
+            {
+                CancelDrag();
+                return;
+            }
+
+            if (!_isDragging)
+            {
+                // No drag occurred, just a normal click
+                CancelDrag();
+                return;
+            }
+
+            var screenPoint = (s as Control)?.PointToScreen(e.Location) ?? Cursor.Position;
+            var targetCell = GetCellAtScreenPoint(screenPoint);
+
+            if (targetCell != null && targetCell != _dragSourceCell)
+                ExecuteDrop(_dragSourceCell, targetCell, ModifierKeys.HasFlag(Keys.Control));
+            CancelDrag();
+        }
+
+        cell.MouseDown += OnMouseDown;
+        cell.MouseMove += OnMouseMove;
+        cell.MouseUp += OnMouseUp;
+    }
+
+    /// <summary>
+    /// Find a SlotCell at the given screen-coordinate point by hit-testing the grid container.
+    /// </summary>
+    private SlotCell? GetCellAtScreenPoint(Point screenPoint)
+    {
+        var clientPoint = _gridContainer.PointToClient(screenPoint);
+        foreach (var cell in _cells)
+        {
+            if (cell.Bounds.Contains(clientPoint))
+                return cell;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Update visual highlight on the current drop target cell.
+    /// </summary>
+    private void UpdateDragHighlight(SlotCell? target)
+    {
+        if (target == _dragHighlightCell) return;
+
+        // Remove highlight from previous target
+        if (_dragHighlightCell != null)
+        {
+            _dragHighlightCell.BackColor = GetDefaultCellBackColor(_dragHighlightCell);
+            _dragHighlightCell.Invalidate();
+        }
+
+        _dragHighlightCell = target;
+
+        // Apply highlight to new target (but not the source itself)
+        if (_dragHighlightCell != null && _dragHighlightCell != _dragSourceCell)
+        {
+            // Only highlight valid drop targets (activated slots, not completely disabled)
+            if (_dragHighlightCell.IsActivated || _dragHighlightCell.IsValidEmpty ||
+                (_dragHighlightCell.SlotData != null && !string.IsNullOrEmpty(_dragHighlightCell.ItemId)))
+            {
+                _dragHighlightCell.BackColor = Color.FromArgb(80, 100, 180, 255);
+                _dragHighlightCell.Invalidate();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the default background colour for a cell based on its state.
+    /// </summary>
+    private Color GetDefaultCellBackColor(SlotCell cell)
+    {
+        return _currentPalette.InventoryGridBg;
+    }
+
+    /// <summary>
+    /// Reset all drag state and visual feedback.
+    /// </summary>
+    private void CancelDrag()
+    {
+        if (_dragHighlightCell != null)
+        {
+            _dragHighlightCell.BackColor = GetDefaultCellBackColor(_dragHighlightCell);
+            _dragHighlightCell.Invalidate();
+        }
+        _dragSourceCell = null;
+        _isDragging = false;
+        _dragHighlightCell = null;
+        Cursor = Cursors.Default;
+    }
+
+    /// <summary>
+    /// Execute a drag-drop operation between two cells.
+    /// Normal drag: swap items if target has an item, move if target is empty.
+    /// Ctrl+drag: duplicate item to target only if the target is empty.
+    /// </summary>
+    private void ExecuteDrop(SlotCell source, SlotCell target, bool ctrlHeld)
+    {
+        if (_slots == null) return;
+
+        // Target must be a valid slot (activated or already contains data)
+        bool targetValid = target.IsActivated || target.IsValidEmpty ||
+            (target.SlotData != null && !string.IsNullOrEmpty(target.ItemId) && !target.IsValidEmpty);
+        if (!targetValid) return;
+
+        bool sourceHasItem = source.SlotData != null && !string.IsNullOrEmpty(source.ItemId) && !source.IsValidEmpty;
+        bool targetHasItem = target.SlotData != null && !string.IsNullOrEmpty(target.ItemId) && !target.IsValidEmpty;
+
+        if (!sourceHasItem) return; // Nothing to move
+
+        if (ctrlHeld)
+        {
+            // Ctrl+drag: duplicate to empty slot only
+            if (targetHasItem) return; // Ignore if target already has an item
+            DuplicateSlotToCell(source, target);
+        }
+        else
+        {
+            // Normal drag: swap if target has item, move if target is empty
+            if (targetHasItem)
+                SwapSlotsBetweenCells(source, target);
+            else
+                MoveSlotToCell(source, target);
+        }
+
+        // Recompute adjacency for the entire grid
+        int maxY = 0;
+        foreach (var c in _cells)
+            if (c.GridY > maxY) maxY = c.GridY;
+        ComputeAdjacency(GridColumns, maxY + 1);
+        foreach (var c in _cells)
+            c.UpdateDisplay();
+
+        // Select the target cell and raise data modified
+        SelectCell(target);
+        RaiseDataModified();
+    }
+
+    /// <summary>
+    /// Move the item from source cell to an empty target cell.
+    /// Updates the slot's Index coordinates to the target position.
+    /// </summary>
+    private void MoveSlotToCell(SlotCell source, SlotCell target)
+    {
+        if (source.SlotData == null) return;
+
+        // Update Index coordinates in the JSON data to the new position
+        InventorySlotHelper.UpdateSlotIndex(source.SlotData, target.GridX, target.GridY);
+
+        // Transfer slot data from source to target
+        target.SlotData = source.SlotData;
+        target.SlotIndex = source.SlotIndex;
+        target.IsValidEmpty = false;
+        target.IsEmpty = false;
+
+        // Preserve corvette override cache so it survives LoadCellData re-resolution
+        target.CorvetteDisplayName = source.CorvetteDisplayName;
+        target.CorvetteIconName = source.CorvetteIconName;
+
+        // Clear source cell
+        source.SlotData = null;
+        source.SlotIndex = -1;
+        ClearCellDisplay(source);
+        source.IsValidEmpty = true;
+
+        // Reload target cell display from its new slot data
+        LoadCellData(target);
+        target.UpdateDisplay();
+        source.UpdateDisplay();
+    }
+
+    /// <summary>
+    /// Swap items between two cells that both contain items.
+    /// Updates Index coordinates in both slot JSON objects.
+    /// </summary>
+    private void SwapSlotsBetweenCells(SlotCell cellA, SlotCell cellB)
+    {
+        if (cellA.SlotData == null || cellB.SlotData == null) return;
+
+        // Swap the Index coordinates in each JSON object
+        InventorySlotHelper.SwapSlotIndices(cellA.SlotData, cellA.GridX, cellA.GridY,
+            cellB.SlotData, cellB.GridX, cellB.GridY);
+
+        // Swap slot data references
+        (cellA.SlotData, cellB.SlotData) = (cellB.SlotData, cellA.SlotData);
+        (cellA.SlotIndex, cellB.SlotIndex) = (cellB.SlotIndex, cellA.SlotIndex);
+
+        // Swap corvette override caches so they follow their respective items
+        (cellA.CorvetteDisplayName, cellB.CorvetteDisplayName) = (cellB.CorvetteDisplayName, cellA.CorvetteDisplayName);
+        (cellA.CorvetteIconName, cellB.CorvetteIconName) = (cellB.CorvetteIconName, cellA.CorvetteIconName);
+
+        // Reload both cells
+        LoadCellData(cellA);
+        LoadCellData(cellB);
+        cellA.UpdateDisplay();
+        cellB.UpdateDisplay();
+    }
+
+    /// <summary>
+    /// Duplicate (copy) the item from source cell to an empty target cell.
+    /// Creates a new JSON slot object with the target's coordinates.
+    /// </summary>
+    private void DuplicateSlotToCell(SlotCell source, SlotCell target)
+    {
+        if (source.SlotData == null || _slots == null) return;
+
+        var newSlot = InventorySlotHelper.DuplicateSlot(source.SlotData, target.GridX, target.GridY);
+
+        // Add or replace slot data in the array
+        if (target.SlotData != null && target.SlotIndex >= 0)
+        {
+            _slots.Set(target.SlotIndex, newSlot);
+        }
+        else
+        {
+            _slots.Add(newSlot);
+            target.SlotIndex = _slots.Length - 1;
+        }
+
+        target.SlotData = newSlot;
+        target.IsValidEmpty = false;
+        target.IsEmpty = false;
+
+        // Preserve corvette override cache for duplicated items
+        target.CorvetteDisplayName = source.CorvetteDisplayName;
+        target.CorvetteIconName = source.CorvetteIconName;
+
+        LoadCellData(target);
+        target.UpdateDisplay();
+    }
+
+    /// <summary>
+    /// Clear display properties on a cell after its item has been moved away.
+    /// </summary>
+    private static void ClearCellDisplay(SlotCell cell)
+    {
+        cell.ItemId = "";
+        cell.DisplayName = "";
+        cell.ItemType = "";
+        cell.Category = "";
+        cell.Amount = 0;
+        cell.MaxAmount = 0;
+        cell.DamageFactor = 0;
+        cell.IconImage = null;
+        cell.ClassMiniIcon = null;
+        cell.ShowAdjacencyBorder = false;
+        cell.AdjacencyBorderColor = Color.Transparent;
+        cell.ItemClass = "";
+        cell.IsChargeable = false;
+        cell.CorvetteDisplayName = null;
+        cell.CorvetteIconName = null;
+    }
+    private void ConfigureContextMenuItems(SlotCell cell)
+    {
+        bool hasItem = cell.SlotData != null && !string.IsNullOrEmpty(cell.ItemId) && !cell.IsValidEmpty;
+        bool canAdd = cell.IsValidEmpty || (!cell.IsEmpty);
+        bool isActivated = cell.IsActivated;
+
+        _addItemMenuItem.Visible = canAdd;
+        _addItemMenuItem.Text = hasItem ? UiStrings.Get("inventory.ctx_replace_item") : UiStrings.Get("inventory.ctx_add_item");
+        _removeItemMenuItem.Visible = hasItem;
+
+        _enableSlotMenuItem.Visible = !_slotToggleDisabled;
+        _enableSlotMenuItem.Text = isActivated ? UiStrings.Get("inventory.ctx_disable_slot") : UiStrings.Get("inventory.ctx_enable_slot");
+        _enableAllSlotsMenuItem.Visible = !_slotToggleDisabled && _currentInventory != null;
+        _pinSlotMenuItem.Visible = _pinSlotFeatureEnabled && isActivated;
+        _pinSlotMenuItem.Text = cell.IsPinnedForAutoStack ? UiStrings.Get("inventory.ctx_unpin_slot") : UiStrings.Get("inventory.ctx_pin_slot");
+
+        _repairSlotMenuItem.Visible = hasItem;
+        _repairAllSlotsMenuItem.Visible = _currentInventory != null;
+
+        _superchargeSlotMenuItem.Visible = !_superchargeDisabled;
+        _superchargeSlotMenuItem.Text = cell.IsSupercharged ? UiStrings.Get("inventory.ctx_remove_supercharge") : UiStrings.Get("inventory.ctx_supercharge");
+        _superchargeAllSlotsMenuItem.Visible = !_superchargeDisabled && _currentInventory != null;
+
+        // Fill Stack: only shown when there's a measurable stack to fill
+        _fillStackMenuItem.Visible = hasItem && cell.MaxAmount > 0;
+
+        // Show "Recharge All Technology" only in tech inventories
+        _rechargeAllTechMenuItem.Visible = _isTechInventory && _currentInventory != null;
+        // Show "Refill All Stacks" only in non-tech (cargo) inventories
+        _refillAllStacksMenuItem.Visible = !_isTechInventory && _currentInventory != null;
+
+        _sortByNameMenuItem.Visible = false;
+        _sortByCategoryMenuItem.Visible = false;
+        bool canAutoStack = _isCargoInventory && !_isStorageInventory && _currentInventory != null;
+        _autoStackToStorageMenuItem.Visible = canAutoStack && (AutoStackToStorageRequested != null || AutoStackSelectedSlotToStorageRequested != null);
+        _autoStackToStarshipMenuItem.Visible = canAutoStack && (AutoStackToStarshipRequested != null || AutoStackSelectedSlotToStarshipRequested != null);
+        _autoStackToFreighterMenuItem.Visible = canAutoStack && (AutoStackToFreighterRequested != null || AutoStackSelectedSlotToFreighterRequested != null);
+
+        _copyItemMenuItem.Visible = cell.SlotData != null && !string.IsNullOrEmpty(cell.ItemId) && !cell.IsValidEmpty;
+        _pasteItemMenuItem.Visible = _copiedItemCell != null && (cell.IsValidEmpty || !cell.IsEmpty);
+    }
+
+    private void OnContextMenuOpening(object? sender, CancelEventArgs e)
+    {
+        if (_contextCell == null || _currentInventory == null)
+        {
+            e.Cancel = true;
+            return;
+        }
+    }
+
+    private void OnCellPinToggleClicked(object? sender, EventArgs e)
+    {
+        if (sender is not SlotCell cell)
+            return;
+        TogglePinnedSlot(cell);
+    }
+
+    private void OnTogglePinnedSlot(object? sender, EventArgs e)
+    {
+        if (_contextCell == null)
+            return;
+        TogglePinnedSlot(_contextCell);
+    }
+
+    private void TogglePinnedSlot(SlotCell cell)
+    {
+        if (!_pinSlotFeatureEnabled || !cell.IsActivated)
+            return;
+
+        var pos = (cell.GridX, cell.GridY);
+        if (!_pinnedSlots.Add(pos))
+            _pinnedSlots.Remove(pos);
+
+        cell.IsPinnedForAutoStack = IsPinnedSlot(cell.GridX, cell.GridY);
+        cell.UpdateDisplay();
+        RaisePinnedSlotsChanged();
+    }
+
+    private void SelectCell(SlotCell cell)
+    {
+        // Deselect previous
+        if (_selectedCell != null)
+            _selectedCell.IsSelected = false;
+
+        cell.IsSelected = true;
+        _selectedCell = cell;
+
+        if (cell.IsEmpty)
+        {
+            ClearDetailPanel();
+            UpdatePickerApplyButtonText();
+            return;
+        }
+
+        if (cell.IsValidEmpty && string.IsNullOrEmpty(cell.ItemId))
+        {
+            // Empty valid slot - show position only
+            _detailItemName.Text = UiStrings.Get("inventory.empty_slot");
+            _detailSlotPosition.Text = $"({cell.GridX}, {cell.GridY})";
+            _detailItemType.Text = "";
+            _detailItemCategory.Text = "";
+            _detailItemId.Text = "";
+            _detailAmount.NumericValue = 0;
+            _detailMaxAmount.NumericValue = 0;
+            _detailDamageFactor.NumericValue = 0;
+            _detailDescription.Text = "";
+            _detailIcon.Image = null;
+            _detailClassIcon.Image = null;
+            _applyButton.Enabled = false;
+            UpdateSeedFieldVisibility(null);
+            UpdatePickerApplyButtonText();
+            return;
+        }
+
+        // Split item ID into base and procedural seed for display in separate fields
+        var (baseId, existingSeed) = StripProceduralSeed(cell.ItemId);
+        _detailItemId.Text = baseId;
+
+        // Resolve game item to determine if procedural, then show/hide seed field
+        GameItem? resolvedForSeed = null;
+        if (_database != null && !string.IsNullOrEmpty(baseId))
+        {
+            var (gi, _, _) = ResolveGameItem(baseId);
+            resolvedForSeed = gi;
+        }
+        UpdateSeedFieldVisibility(resolvedForSeed, existingSeed);
+
+        // Update labels based on whether this is a chargeable tech item
+        if (cell.IsTechChargeable)
+        {
+            _detailAmountLabel.Text = UiStrings.Get("inventory.charge");
+            _detailMaxLabel.Text = UiStrings.Get("inventory.max_charge");
+        }
+        else
+        {
+            _detailAmountLabel.Text = UiStrings.Get("inventory.amount");
+            _detailMaxLabel.Text = UiStrings.Get("inventory.max");
+        }
+
+        // Always show actual values and keep controls enabled so the user can freely edit them.
+        _detailAmount.NumericValue = Math.Clamp(cell.Amount, (int)(_detailAmount.Minimum ?? int.MinValue), (int)(_detailAmount.Maximum ?? int.MaxValue));
+        _detailMaxAmount.NumericValue = Math.Clamp(cell.MaxAmount, (int)(_detailMaxAmount.Minimum ?? int.MinValue), (int)(_detailMaxAmount.Maximum ?? int.MaxValue));
+        _detailAmount.Enabled = true;
+        _detailMaxAmount.Enabled = true;
+
+        _detailDamageFactor.NumericValue = cell.DamageFactor;
+        _detailSlotPosition.Text = $"({cell.GridX}, {cell.GridY})";
+        _applyButton.Enabled = true;
+
+        if (!string.IsNullOrEmpty(cell.DisplayName))
+            _detailItemName.Text = cell.DisplayName;
+        else if (!string.IsNullOrEmpty(cell.ItemId))
+            _detailItemName.Text = cell.ItemId;
+        else
+            _detailItemName.Text = UiStrings.Get("inventory.empty_slot");
+
+        _detailItemType.Text = cell.ItemType;
+        _detailItemCategory.Text = GetLocalisedCategoryName(cell.Category);
+
+        // Show icon in detail panel
+        _detailIcon.Image = cell.IconImage;
+
+        // Show class mini icon from the cell (same data that drives grid icon overlays)
+        _detailClassIcon.Image = cell.ClassMiniIcon;
+
+        // Store description for tooltip (shown via info button hover)
+        if (_database != null && !string.IsNullOrEmpty(cell.ItemId))
+        {
+            var (item, _, _, _) = ResolveItemAndDisplayName(cell.ItemId);
+            _detailDescription.Text = item?.Description ?? "";
+        }
+        else
+        {
+            _detailDescription.Text = "";
+        }
+
+        // Update picker button text since slot occupancy may have changed
+        UpdatePickerApplyButtonText();
+    }
+
+    private void OnApplyChanges(object? sender, EventArgs e)
+    {
+        if (_selectedCell == null || _slots == null) return;
+
+        string newItemId = _detailItemId.Text.Trim();
+        if (string.IsNullOrEmpty(newItemId))
+        {
+            MessageBox.Show(this, UiStrings.Get("inventory.apply_enter_id"), UiStrings.Get("inventory.apply_changes_title"),
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // Read values from detail controls - respect user-specified values.
+        int amount = (int)(_detailAmount.NumericValue ?? 0);
+        int maxAmount = (int)(_detailMaxAmount.NumericValue ?? 0);
+
+        // Strip any seed the user may have typed directly into the ID field
+        var (cleanBaseId, _) = StripProceduralSeed(newItemId);
+        newItemId = cleanBaseId;
+
+        // Determine inventory type early so we can handle tech items correctly.
+        string invType = "Product";
+        GameItem? gameItem = null;
+        if (_database != null)
+        {
+            (gameItem, _, _) = ResolveGameItem(newItemId);
+            if (gameItem != null)
+                invType = ResolveInventoryTypeForItem(gameItem);
+        }
+
+        // Tech pack hash IDs (^+12 hex chars) are always stored as Product.
+        if (IsTechPackHash(newItemId))
+            invType = "Product";
+
+        // Figurines (BOBBLE_*) installed in tech slots need the T_ prefix.
+        // The game stores them as ^T_BOBBLE_APOLLO (technology form) vs
+        // ^BOBBLE_APOLLO (product/cargo form).
+        string saveItemId = newItemId;
+        if (gameItem != null && IsFigurineItem(gameItem.Id) && _isTechInventory)
+        {
+            saveItemId = "T_" + gameItem.Id;
+            invType = "Technology";
+        }
+
+        // Technology: MaxAmount = ChargeAmount (always). Amount defaults using BuildFullyCharged.
+        // Verified against MXML, game save, and other editor behaviour.
+        if (invType == "Technology")
+        {
+            int techMaxAmount = gameItem != null
+                ? InventoryStackDatabase.GetMaxAmount(gameItem, "Technology", _inventoryGroup)
+                : 100;
+            if (maxAmount == 0) maxAmount = techMaxAmount;
+            if (amount == 0)
+                amount = (gameItem != null && gameItem.BuildFullyCharged)
+                    ? techMaxAmount
+                    : 0;
+        }
+        else
+        {
+            // For non-technology items, zero amounts are treated as unset - default to 1.
+            // Negative values are intentionally preserved as they are valid game data.
+            if (amount == 0 && maxAmount == 0) { amount = 1; maxAmount = 1; }
+            if (maxAmount == 0) maxAmount = amount;
+        }
+
+        // Build the final save ID, incorporating seed from the dedicated field for procedural items
+        string finalSaveId = BuildSaveItemId(saveItemId, gameItem);
+
+        // If the cell has no existing slot data (valid empty slot), create a new slot
+        if (_selectedCell.SlotData == null)
+        {
+            var newSlot = new JsonObject();
+            var typeObj = new JsonObject();
+            typeObj.Add("InventoryType", invType);
+            newSlot.Add("Type", typeObj);
+
+            newSlot.Add("Id", BuildBinaryIdValue(finalSaveId, _selectedCell.OriginalBinaryIdBody));
+            newSlot.Add("Amount", amount);
+            newSlot.Add("MaxAmount", maxAmount);
+            newSlot.Add("DamageFactor", _detailDamageFactor.NumericValue ?? 0.0);
+            newSlot.Add("FullyInstalled", true);
+            newSlot.Add("AddedAutomatically", false);
+            var indexObj = new JsonObject();
+            indexObj.Add("X", _selectedCell.GridX);
+            indexObj.Add("Y", _selectedCell.GridY);
+            newSlot.Add("Index", indexObj);
+
+            _slots.Add(newSlot);
+            _selectedCell.SlotIndex = _slots.Length - 1;
+            _selectedCell.SlotData = newSlot;
+        }
+        else
+        {
+            var slot = _selectedCell.SlotData;
+
+            // Update Item ID (reconstruct BinaryData for tech pack hash IDs)
+            try { slot.Set("Id", BuildBinaryIdValue(finalSaveId, _selectedCell.OriginalBinaryIdBody)); } catch { }
+
+            // Update Amount / MaxAmount
+            RawNumberGuard.SetInt(slot, "Amount", amount);
+            RawNumberGuard.SetInt(slot, "MaxAmount", maxAmount);
+
+            // Update DamageFactor (preserve RawDouble if value unchanged)
+            try
+            {
+                double newDmg = _detailDamageFactor.NumericValue ?? 0.0;
+                var existing = slot.Get("DamageFactor");
+                if (!(existing is RawDouble rd && rd.Value == newDmg))
+                    slot.Set("DamageFactor", newDmg);
+            }
+            catch { }
+
+            // Update inventory type based on item
+            try
+            {
+                var typeObj = slot.GetObject("Type");
+                if (typeObj != null)
+                    typeObj.Set("InventoryType", invType);
+            }
+            catch { }
+        }
+
+        // Refresh cell display - store the full save ID (with seed) in the cell for display
+        _selectedCell.ItemId = finalSaveId;
+        _selectedCell.Amount = amount;
+        _selectedCell.MaxAmount = maxAmount;
+        _selectedCell.DamageFactor = _detailDamageFactor.NumericValue ?? 0.0;
+        _selectedCell.IsValidEmpty = false;
+        _selectedCell.IsEmpty = false;
+
+        if (_database != null && !string.IsNullOrEmpty(finalSaveId))
+        {
+            var (resolvedItem, displayName, techPackIcon, techPackClass) = ResolveItemAndDisplayName(finalSaveId);
+            if (resolvedItem != null)
+            {
+                _selectedCell.DisplayName = displayName;
+                _selectedCell.ItemType = resolvedItem.ItemType;
+                _selectedCell.Category = resolvedItem.Category;
+                _detailItemName.Text = displayName;
+                _detailItemType.Text = resolvedItem.ItemType;
+                _detailItemCategory.Text = GetLocalisedCategoryName(resolvedItem.Category);
+                _detailDescription.Text = resolvedItem.Description;
+
+                // Set item class from TechPack if available, else from Quality field
+                if (!string.IsNullOrEmpty(techPackClass))
+                    _selectedCell.ItemClass = techPackClass;
+                else if (!string.IsNullOrEmpty(resolvedItem.Quality))
+                {
+                    var qClass = resolvedItem.QualityToClass();
+                    if (!string.IsNullOrEmpty(qClass))
+                        _selectedCell.ItemClass = qClass;
+                }
+
+                // Fallback: derive class from Rarity for upgrades where Quality is absent
+                if (string.IsNullOrEmpty(_selectedCell.ItemClass) && !string.IsNullOrEmpty(resolvedItem.Rarity))
+                {
+                    var rClass = resolvedItem.RarityToClass();
+                    if (!string.IsNullOrEmpty(rClass))
+                        _selectedCell.ItemClass = rClass;
+                }
+
+                string iconName = techPackIcon ?? resolvedItem.Icon;
+                if (_iconManager != null && !string.IsNullOrEmpty(iconName))
+                {
+                    _selectedCell.IconImage = _iconManager.GetIcon(iconName);
+                    _detailIcon.Image = _selectedCell.IconImage;
+                }
+
+                // Load class mini icon overlay only for Technology, Technology Module, and Upgrades types
+                if (_iconManager != null && !string.IsNullOrEmpty(_selectedCell.ItemClass) && _selectedCell.ItemClass != "NONE"
+                    && ShouldShowClassMiniIcon(resolvedItem.ItemType, finalSaveId))
+                    _selectedCell.ClassMiniIcon = _iconManager.GetIcon($"CLASSMINI.{_selectedCell.ItemClass}.png");
+                else
+                    _selectedCell.ClassMiniIcon = null;
+            }
+            else
+            {
+                _selectedCell.DisplayName = displayNameFromId(finalSaveId);
+                _detailItemName.Text = _selectedCell.DisplayName;
+                _detailDescription.Text = "";
+            }
+        }
+
+        _selectedCell.UpdateDisplay();
+        RaiseDataModified();
+    }
+
+    /// <summary>
+    /// Applies the item from the picker detail section into the currently selected slot.
+    /// Reads values from the picker controls (not the slot detail controls).
+    /// </summary>
+    private void OnPickerApplyItem(object? sender, EventArgs e)
+    {
+        if (_selectedCell == null || _slots == null) return;
+
+        string newItemId = _pickerItemId.Text.Trim();
+        if (string.IsNullOrEmpty(newItemId))
+        {
+            MessageBox.Show(this, UiStrings.Get("inventory.picker_enter_id"), UiStrings.Get("inventory.add_item_title"),
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // Read values from picker controls
+        int amount = (int)(_pickerAmount.NumericValue ?? 0);
+        int maxAmount = (int)(_pickerMaxAmount.NumericValue ?? 0);
+
+        // Strip any seed the user may have typed directly into the ID field
+        var (cleanBaseId, _) = StripProceduralSeed(newItemId);
+        newItemId = cleanBaseId;
+
+        // Determine inventory type early so we can handle tech items correctly.
+        string invType = "Product";
+        GameItem? gameItem = null;
+        if (_database != null)
+        {
+            (gameItem, _, _) = ResolveGameItem(newItemId);
+            if (gameItem != null)
+                invType = ResolveInventoryTypeForItem(gameItem);
+        }
+
+        // Tech pack hash IDs (^+12 hex chars) are always stored as Product.
+        if (IsTechPackHash(newItemId))
+            invType = "Product";
+
+        // Figurines (BOBBLE_*) installed in tech slots need the T_ prefix.
+        string saveItemId = newItemId;
+        if (gameItem != null && IsFigurineItem(gameItem.Id) && _isTechInventory)
+        {
+            saveItemId = "T_" + gameItem.Id;
+            invType = "Technology";
+        }
+
+        // Technology: MaxAmount = ChargeAmount (always). Amount defaults using BuildFullyCharged.
+        if (invType == "Technology")
+        {
+            int techMaxAmount = gameItem != null
+                ? InventoryStackDatabase.GetMaxAmount(gameItem, "Technology", _inventoryGroup)
+                : 100;
+            if (maxAmount == 0) maxAmount = techMaxAmount;
+            if (amount == 0)
+                amount = (gameItem != null && gameItem.BuildFullyCharged)
+                    ? techMaxAmount
+                    : 0;
+        }
+        else
+        {
+            // For non-technology items, zero amounts are treated as unset - default to 1.
+            // Negative values are intentionally preserved as they are valid game data.
+            if (amount == 0 && maxAmount == 0) { amount = 1; maxAmount = 1; }
+            if (maxAmount == 0) maxAmount = amount;
+        }
+
+        // Build the final save ID using the picker seed field
+        string finalSaveId = BuildPickerSaveItemId(saveItemId, gameItem);
+
+        // If the cell has no existing slot data (valid empty slot), create a new slot
+        if (_selectedCell.SlotData == null)
+        {
+            var newSlot = new JsonObject();
+            var typeObj = new JsonObject();
+            typeObj.Add("InventoryType", invType);
+            newSlot.Add("Type", typeObj);
+
+            newSlot.Add("Id", BuildBinaryIdValue(finalSaveId, _selectedCell.OriginalBinaryIdBody));
+            newSlot.Add("Amount", amount);
+            newSlot.Add("MaxAmount", maxAmount);
+            newSlot.Add("DamageFactor", _pickerDamageFactor.NumericValue ?? 0.0);
+            newSlot.Add("FullyInstalled", true);
+            newSlot.Add("AddedAutomatically", false);
+            var indexObj = new JsonObject();
+            indexObj.Add("X", _selectedCell.GridX);
+            indexObj.Add("Y", _selectedCell.GridY);
+            newSlot.Add("Index", indexObj);
+
+            _slots.Add(newSlot);
+            _selectedCell.SlotIndex = _slots.Length - 1;
+            _selectedCell.SlotData = newSlot;
+        }
+        else
+        {
+            var slot = _selectedCell.SlotData;
+
+            // Update Item ID (reconstruct BinaryData for tech pack hash IDs)
+            try { slot.Set("Id", BuildBinaryIdValue(finalSaveId, _selectedCell.OriginalBinaryIdBody)); } catch { }
+
+            // Update Amount / MaxAmount
+            RawNumberGuard.SetInt(slot, "Amount", amount);
+            RawNumberGuard.SetInt(slot, "MaxAmount", maxAmount);
+
+            // Update DamageFactor (preserve RawDouble if value unchanged)
+            try
+            {
+                double newDmg = _pickerDamageFactor.NumericValue ?? 0.0;
+                var existing = slot.Get("DamageFactor");
+                if (!(existing is RawDouble rd && rd.Value == newDmg))
+                    slot.Set("DamageFactor", newDmg);
+            }
+            catch { }
+
+            // Update inventory type based on item
+            try
+            {
+                var typeObj = slot.GetObject("Type");
+                if (typeObj != null)
+                    typeObj.Set("InventoryType", invType);
+            }
+            catch { }
+        }
+
+        // Refresh cell display
+        _selectedCell.ItemId = finalSaveId;
+        _selectedCell.Amount = amount;
+        _selectedCell.MaxAmount = maxAmount;
+        _selectedCell.DamageFactor = _pickerDamageFactor.NumericValue ?? 0.0;
+        _selectedCell.IsValidEmpty = false;
+        _selectedCell.IsEmpty = false;
+
+        if (_database != null && !string.IsNullOrEmpty(finalSaveId))
+        {
+            var (resolvedItem, displayName, techPackIcon, techPackClass) = ResolveItemAndDisplayName(finalSaveId);
+            if (resolvedItem != null)
+            {
+                _selectedCell.DisplayName = displayName;
+                _selectedCell.ItemType = resolvedItem.ItemType;
+                _selectedCell.Category = resolvedItem.Category;
+
+                if (!string.IsNullOrEmpty(techPackClass))
+                    _selectedCell.ItemClass = techPackClass;
+                else if (!string.IsNullOrEmpty(resolvedItem.Quality))
+                {
+                    var qClass = resolvedItem.QualityToClass();
+                    if (!string.IsNullOrEmpty(qClass))
+                        _selectedCell.ItemClass = qClass;
+                }
+
+                if (string.IsNullOrEmpty(_selectedCell.ItemClass) && !string.IsNullOrEmpty(resolvedItem.Rarity))
+                {
+                    var rClass = resolvedItem.RarityToClass();
+                    if (!string.IsNullOrEmpty(rClass))
+                        _selectedCell.ItemClass = rClass;
+                }
+
+                string iconName = techPackIcon ?? resolvedItem.Icon;
+                if (_iconManager != null && !string.IsNullOrEmpty(iconName))
+                    _selectedCell.IconImage = _iconManager.GetIcon(iconName);
+
+                if (_iconManager != null && !string.IsNullOrEmpty(_selectedCell.ItemClass) && _selectedCell.ItemClass != "NONE"
+                    && ShouldShowClassMiniIcon(resolvedItem.ItemType, finalSaveId))
+                    _selectedCell.ClassMiniIcon = _iconManager.GetIcon($"CLASSMINI.{_selectedCell.ItemClass}.png");
+                else
+                    _selectedCell.ClassMiniIcon = null;
+            }
+            else
+            {
+                _selectedCell.DisplayName = displayNameFromId(finalSaveId);
+            }
+        }
+
+        _selectedCell.UpdateDisplay();
+
+        // Also refresh the slot detail panel to show the new item
+        SelectCell(_selectedCell);
+
+        // Update the picker button text since the slot now has an item
+        UpdatePickerApplyButtonText();
+
+        RaiseDataModified();
+    }
+
+    private void OnAddItem(object? sender, EventArgs e)
+    {
+        if (_contextCell == null || _currentInventory == null) return;
+
+        // Get the selected item from the picker or the ID field
+        string itemId = _detailItemId.Text.Trim();
+
+        if (_itemPicker.SelectedItem is GameItem pickedItem)
+            itemId = pickedItem.Id;
+
+        if (string.IsNullOrEmpty(itemId))
+        {
+            MessageBox.Show(this, UiStrings.Get("inventory.add_select_first"),
+                UiStrings.Get("inventory.add_item_title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // Strip any seed from the item ID (seed comes from the dedicated field)
+        var (cleanId, _) = StripProceduralSeed(itemId);
+        itemId = cleanId;
+
+        // Read the numeric values from detail controls - always use user-specified values.
+        int amount = (int)(_detailAmount.NumericValue ?? 0);
+        int maxAmount = (int)(_detailMaxAmount.NumericValue ?? 0);
+
+        // Determine inventory type
+        string invType = "Product";
+        GameItem? gameItem = null;
+        if (_database != null)
+        {
+            (gameItem, _, _) = ResolveGameItem(itemId);
+            if (gameItem != null)
+                invType = ResolveInventoryTypeForItem(gameItem);
+        }
+
+        // Figurines (BOBBLE_*) installed in tech slots need the T_ prefix.
+        string saveItemId = itemId;
+        if (gameItem != null && IsFigurineItem(gameItem.Id) && _isTechInventory)
+        {
+            saveItemId = "T_" + gameItem.Id;
+            invType = "Technology";
+        }
+
+        // Technology: MaxAmount = ChargeAmount (always). Amount defaults using BuildFullyCharged.
+        // Verified against MXML, game save, and other editor behaviour.
+        if (invType == "Technology")
+        {
+            int techMaxAmount = gameItem != null
+                ? InventoryStackDatabase.GetMaxAmount(gameItem, "Technology", _inventoryGroup)
+                : 100;
+            if (maxAmount == 0) maxAmount = techMaxAmount;
+            if (amount == 0)
+                amount = (gameItem != null && gameItem.BuildFullyCharged)
+                    ? techMaxAmount
+                    : 0;
+        }
+        else
+        {
+            // For non-technology items, zero amounts are treated as unset - default to 1.
+            // Negative values are intentionally preserved as they are valid game data.
+            if (amount == 0 && maxAmount == 0) { amount = 1; maxAmount = 1; }
+            if (maxAmount == 0) maxAmount = amount;
+        }
+
+        // Build the final save ID using the seed from the dedicated field
+        string itemIdToWrite = BuildSaveItemId(saveItemId, gameItem);
+
+        // Create a new slot JSON object
+        var newSlot = new JsonObject();
+
+        var typeObj = new JsonObject();
+        typeObj.Add("InventoryType", invType);
+        newSlot.Add("Type", typeObj);
+        newSlot.Add("Id", itemIdToWrite);
+
+        newSlot.Add("Amount", amount);
+        newSlot.Add("MaxAmount", maxAmount);
+        newSlot.Add("DamageFactor", 0.0);
+        newSlot.Add("FullyInstalled", true);
+        newSlot.Add("AddedAutomatically", false);
+
+        var indexObj = new JsonObject();
+        indexObj.Add("X", _contextCell.GridX);
+        indexObj.Add("Y", _contextCell.GridY);
+        newSlot.Add("Index", indexObj);
+
+        // If cell already has slot data, replace it in the array
+        if (_contextCell.SlotData != null && _contextCell.SlotIndex >= 0 && _slots != null)
+        {
+            _slots.Set(_contextCell.SlotIndex, newSlot);
+        }
+        else if (_slots != null)
+        {
+            // Add new slot to the array
+            _slots.Add(newSlot);
+            _contextCell.SlotIndex = _slots.Length - 1;
+        }
+
+        // Update cell
+        _contextCell.SlotData = newSlot;
+        _contextCell.IsValidEmpty = false;
+        _contextCell.IsEmpty = false;
+        LoadCellData(_contextCell);
+        _contextCell.UpdateDisplay();
+
+        // Select the newly added cell
+        SelectCell(_contextCell);
+        RaiseDataModified();
+    }
+
+    private void OnRemoveItem(object? sender, EventArgs e)
+    {
+        if (_contextCell?.SlotData == null || _slots == null) return;
+
+        var result = MessageBox.Show(this, 
+            UiStrings.Format("inventory.remove_confirm", _contextCell.DisplayName ?? _contextCell.ItemId, _contextCell.GridX, _contextCell.GridY),
+            UiStrings.Get("inventory.remove_title"), MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+        if (result != DialogResult.Yes) return;
+
+        RemoveSlotEntry(_contextCell);
+        _contextCell.UpdateDisplay();
+
+        // Recompute adjacency for the entire grid since neighbors may have changed
+        int maxY = 0;
+        foreach (var c in _cells)
+            if (c.GridY > maxY) maxY = c.GridY;
+        ComputeAdjacency(GridColumns, maxY + 1);
+        foreach (var c in _cells)
+            c.UpdateDisplay();
+
+        // Clear detail panel
+        if (_selectedCell == _contextCell)
+            ClearDetailPanel();
+        RaiseDataModified();
+    }
+
+    private void OnEnableSlot(object? sender, EventArgs e)
+    {
+        if (_contextCell == null || _currentInventory == null) return;
+        var validSlots = _currentInventory.GetArray("ValidSlotIndices");
+        if (validSlots == null)
+        {
+            validSlots = new JsonArray();
+            _currentInventory.Set("ValidSlotIndices", validSlots);
+        }
+
+        int x = _contextCell.GridX, y = _contextCell.GridY;
+
+        if (_contextCell.IsActivated)
+        {
+            // Disable: only allowed if slot has no item
+            if (_contextCell.SlotData != null && !string.IsNullOrEmpty(_contextCell.ItemId)
+                && _contextCell.ItemId != "^" && _contextCell.ItemId != "^YOURSLOTITEM")
+            {
+                MessageBox.Show(this, UiStrings.Get("inventory.cannot_disable"),
+                    UiStrings.Get("inventory.cannot_disable_title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            // Remove from ValidSlotIndices
+            for (int i = 0; i < validSlots.Length; i++)
+            {
+                var idx = validSlots.GetObject(i);
+                if (idx != null && idx.GetInt("X") == x && idx.GetInt("Y") == y)
+                {
+                    validSlots.RemoveAt(i);
+                    break;
+                }
+            }
+            _pinnedSlots.Remove((x, y));
+            _contextCell.IsActivated = false;
+            _contextCell.ShowPinToggle = false;
+            _contextCell.IsPinnedForAutoStack = false;
+            RaisePinnedSlotsChanged();
+        }
+        else
+        {
+            // Enable: add to ValidSlotIndices
+            var newIdx = new JsonObject();
+            newIdx.Add("X", x);
+            newIdx.Add("Y", y);
+            validSlots.Add(newIdx);
+            _contextCell.IsActivated = true;
+            _contextCell.IsEmpty = false;
+            _contextCell.IsValidEmpty = true;
+            _contextCell.ShowPinToggle = _pinSlotFeatureEnabled;
+            _contextCell.IsPinnedForAutoStack = IsPinnedSlot(x, y);
+        }
+        _contextCell.UpdateDisplay();
+    }
+
+    private void OnEnableAllSlots(object? sender, EventArgs e)
+    {
+        if (_currentInventory == null) return;
+        var validSlots = _currentInventory.GetArray("ValidSlotIndices");
+        if (validSlots == null)
+        {
+            validSlots = new JsonArray();
+            _currentInventory.Set("ValidSlotIndices", validSlots);
+        }
+
+        var existing = new HashSet<(int, int)>();
+        for (int i = 0; i < validSlots.Length; i++)
+        {
+            try
+            {
+                var idx = validSlots.GetObject(i);
+                if (idx != null) existing.Add((idx.GetInt("X"), idx.GetInt("Y")));
+            }
+            catch { }
+        }
+
+        foreach (var cell in _cells)
+        {
+            if (!existing.Contains((cell.GridX, cell.GridY)))
+            {
+                var newIdx = new JsonObject();
+                newIdx.Add("X", cell.GridX);
+                newIdx.Add("Y", cell.GridY);
+                validSlots.Add(newIdx);
+            }
+            cell.IsActivated = true;
+            cell.UpdateDisplay();
+        }
+    }
+
+    /// <summary>
+    /// Repairs a single slot: clears damage state, fixes Amount, removes
+    /// BlockedByBrokenTech markers. Returns true if the slot contains a
+    /// damage placeholder item that should be removed from the inventory.
+    /// </summary>
+    private bool RepairSlotData(SlotCell cell)
+    {
+        if (cell.SlotData == null || _currentInventory == null) return false;
+
+        // Detect damage placeholder items before clearing state so callers
+        // can remove them after this method returns.
+        bool isDamagePlaceholder = InventorySlotHelper.IsDamageSlotItem(cell.ItemId);
+
+        bool wasDamaged = cell.DamageFactor > 0;
+
+        try { cell.SlotData.Set("DamageFactor", 0.0); } catch { }
+        cell.DamageFactor = 0;
+
+        try { cell.SlotData.Set("FullyInstalled", true); } catch { }
+
+        // Fix Amount when the slot was in a damaged/unfinished state (Amount == -1).
+        // Damaged tech in game uses Amount = -1 with DamageFactor = 1.0.
+        // A repaired item needs its Amount set to the correct default, matching
+        // what the game and OnApplyChanges use for fully installed tech.
+        if (wasDamaged && cell.Amount < 0 && !string.IsNullOrEmpty(cell.ItemId))
+        {
+            var (gameItem, _, _) = ResolveGameItem(cell.ItemId);
+            if (gameItem != null)
+            {
+                string invType = ResolveInventoryTypeForItem(gameItem);
+                if (invType == "Technology")
+                {
+                    int techMaxAmount = InventoryStackDatabase.GetMaxAmount(gameItem, "Technology", _inventoryGroup);
+                    int repairedAmount = gameItem.BuildFullyCharged ? techMaxAmount : 0;
+                    try { cell.SlotData.Set("Amount", repairedAmount); } catch { }
+                    cell.Amount = repairedAmount;
+                }
+            }
+        }
+
+        // Remove BlockedByBrokenTech from SpecialSlots
+        try
+        {
+            var specialSlots = _currentInventory.GetArray("SpecialSlots");
+            if (specialSlots != null)
+            {
+                for (int i = specialSlots.Length - 1; i >= 0; i--)
+                {
+                    var entry = specialSlots.GetObject(i);
+                    if (entry == null) continue;
+                    var typeObj = entry.GetObject("Type");
+                    if (typeObj == null) continue;
+                    string slotType = typeObj.GetString("InventorySpecialSlotType") ?? "";
+                    if (slotType != "BlockedByBrokenTech") continue;
+                    var idxObj = entry.GetObject("Index");
+                    if (idxObj == null) continue;
+                    if (idxObj.GetInt("X") == cell.GridX && idxObj.GetInt("Y") == cell.GridY)
+                        specialSlots.RemoveAt(i);
+                }
+            }
+        }
+        catch { }
+
+        return isDamagePlaceholder;
+    }
+
+    /// <summary>
+    /// Removes a slot entry from the Slots JSON array and clears the cell.
+    /// Does not recompute adjacency - callers should do that once after all removals.
+    /// </summary>
+    private void RemoveSlotEntry(SlotCell cell)
+    {
+        if (_slots == null) return;
+
+        int removedIndex = cell.SlotIndex;
+        if (removedIndex >= 0 && removedIndex < _slots.Length)
+        {
+            _slots.RemoveAt(removedIndex);
+
+            foreach (var c in _cells)
+            {
+                if (c.SlotIndex > removedIndex)
+                    c.SlotIndex--;
+            }
+        }
+
+        cell.SlotData = null;
+        cell.SlotIndex = -1;
+        cell.ItemId = "";
+        cell.DisplayName = "";
+        cell.ItemType = "";
+        cell.Category = "";
+        cell.Amount = 0;
+        cell.MaxAmount = 0;
+        cell.DamageFactor = 0;
+        cell.IconImage = null;
+        cell.ClassMiniIcon = null;
+        cell.ShowAdjacencyBorder = false;
+        cell.AdjacencyBorderColor = Color.Transparent;
+        cell.IsValidEmpty = true;
+    }
+
+    private void OnRepairSlot(object? sender, EventArgs e)
+    {
+        if (_contextCell == null) return;
+        bool wasDamagePlaceholder = RepairSlotData(_contextCell);
+
+        if (wasDamagePlaceholder && _slots != null)
+        {
+            RemoveSlotEntry(_contextCell);
+
+            // Recompute adjacency since a slot was cleared
+            int maxY = 0;
+            foreach (var c in _cells)
+                if (c.GridY > maxY) maxY = c.GridY;
+            ComputeAdjacency(GridColumns, maxY + 1);
+            foreach (var c in _cells)
+                c.UpdateDisplay();
+
+            if (_selectedCell == _contextCell)
+                ClearDetailPanel();
+        }
+        else
+        {
+            _contextCell.UpdateDisplay();
+        }
+
+        RaiseDataModified();
+    }
+
+    private void OnRepairAllSlots(object? sender, EventArgs e)
+    {
+        // Repair all slots first, collecting damage placeholders to remove
+        var toRemove = new List<SlotCell>();
+        foreach (var cell in _cells)
+        {
+            bool wasDamagePlaceholder = RepairSlotData(cell);
+            if (wasDamagePlaceholder)
+                toRemove.Add(cell);
+        }
+
+        // Remove damage placeholder items from highest SlotIndex first
+        // so earlier removals don't shift indices of later ones.
+        if (toRemove.Count > 0 && _slots != null)
+        {
+            toRemove.Sort((a, b) => b.SlotIndex.CompareTo(a.SlotIndex));
+            foreach (var cell in toRemove)
+                RemoveSlotEntry(cell);
+        }
+
+        // Recompute adjacency and refresh all cells
+        int maxY = 0;
+        foreach (var c in _cells)
+            if (c.GridY > maxY) maxY = c.GridY;
+        ComputeAdjacency(GridColumns, maxY + 1);
+        foreach (var c in _cells)
+            c.UpdateDisplay();
+
+        if (_selectedCell != null && toRemove.Contains(_selectedCell))
+            ClearDetailPanel();
+
+        RaiseDataModified();
+    }
+
+    /// <summary>
+    /// Toggles or adds a supercharge on the given cell.
+    /// Returns true if a supercharge was added or removed, false if blocked by constraints.
+    /// </summary>
+    private bool ToggleSupercharge(SlotCell cell, bool forceAdd, bool showWarnings = false)
+    {
+        if (_currentInventory == null || _superchargeDisabled) return false;
+        var specialSlots = _currentInventory.GetArray("SpecialSlots");
+        if (specialSlots == null)
+        {
+            specialSlots = new JsonArray();
+            _currentInventory.Set("SpecialSlots", specialSlots);
+        }
+
+        int x = cell.GridX, y = cell.GridY;
+        // Check if already supercharged - allow removal without constraints
+        if (!forceAdd)
+        {
+            for (int i = specialSlots.Length - 1; i >= 0; i--)
+            {
+                try
+                {
+                    var entry = specialSlots.GetObject(i);
+                    if (entry == null) continue;
+                    var typeObj = entry.GetObject("Type");
+                    if (typeObj == null) continue;
+                    string slotType = typeObj.GetString("InventorySpecialSlotType") ?? "";
+                    if (slotType != "TechBonus") continue;
+                    var idxObj = entry.GetObject("Index");
+                    if (idxObj == null) continue;
+                    if (idxObj.GetInt("X") == x && idxObj.GetInt("Y") == y)
+                    {
+                        specialSlots.RemoveAt(i);
+                        cell.IsSupercharged = false;
+                        return true;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // Not found or forceAdd - check not already present when forceAdd
+        if (forceAdd && IsSlotSupercharged(x, y))
+        {
+            cell.IsSupercharged = true;
+            return false;
+        }
+
+        // Enforce row constraint before adding
+        if (_maxSuperchargeRow >= 0 && y > _maxSuperchargeRow)
+        {
+            if (showWarnings)
+                MessageBox.Show(this, 
+                    UiStrings.Format("inventory.supercharge_max_msg", _maxSuperchargeRow + 1),
+                    UiStrings.Get("inventory.supercharge_title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        // Enforce max slot count before adding
+        if (_maxSuperchargedSlots >= 0 && CountSuperchargedSlots() >= _maxSuperchargedSlots)
+        {
+            if (showWarnings)
+                MessageBox.Show(this, 
+                    UiStrings.Format("inventory.supercharge_added_msg", _maxSuperchargedSlots),
+                    UiStrings.Get("inventory.supercharge_title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        var newEntry = new JsonObject();
+        var newType = new JsonObject();
+        newType.Add("InventorySpecialSlotType", "TechBonus");
+        newEntry.Add("Type", newType);
+        var newIndex = new JsonObject();
+        newIndex.Add("X", x);
+        newIndex.Add("Y", y);
+        newEntry.Add("Index", newIndex);
+        specialSlots.Add(newEntry);
+        cell.IsSupercharged = true;
+        return true;
+    }
+
+    private void OnSuperchargeSlot(object? sender, EventArgs e)
+    {
+        if (_contextCell == null) return;
+        ToggleSupercharge(_contextCell, false, showWarnings: true);
+        _contextCell.UpdateDisplay();
+    }
+
+    private void OnSuperchargeAllSlots(object? sender, EventArgs e)
+    {
+        if (_superchargeDisabled || _currentInventory == null) return;
+        var specialSlots = _currentInventory.GetArray("SpecialSlots");
+        if (specialSlots == null)
+        {
+            specialSlots = new JsonArray();
+            _currentInventory.Set("SpecialSlots", specialSlots);
+        }
+
+        // Build a cached set of already-supercharged positions for O(1) lookups
+        var alreadySupercharged = new HashSet<(int, int)>();
+        for (int i = 0; i < specialSlots.Length; i++)
+        {
+            try
+            {
+                var entry = specialSlots.GetObject(i);
+                if (entry == null) continue;
+                var typeObj = entry.GetObject("Type");
+                if (typeObj == null) continue;
+                if ((typeObj.GetString("InventorySpecialSlotType") ?? "") != "TechBonus") continue;
+                var idxObj = entry.GetObject("Index");
+                if (idxObj != null)
+                    alreadySupercharged.Add((idxObj.GetInt("X"), idxObj.GetInt("Y")));
+            }
+            catch { }
+        }
+
+        int currentCount = alreadySupercharged.Count;
+
+        foreach (var cell in _cells)
+        {
+            // Skip if already supercharged
+            if (alreadySupercharged.Contains((cell.GridX, cell.GridY)))
+            {
+                cell.IsSupercharged = true;
+                cell.UpdateDisplay();
+                continue;
+            }
+
+            // Enforce row constraint
+            if (_maxSuperchargeRow >= 0 && cell.GridY > _maxSuperchargeRow)
+            {
+                cell.UpdateDisplay();
+                continue;
+            }
+
+            // Enforce max slot count
+            if (_maxSuperchargedSlots >= 0 && currentCount >= _maxSuperchargedSlots)
+            {
+                cell.UpdateDisplay();
+                continue;
+            }
+
+            // Add supercharge entry
+            var newEntry = new JsonObject();
+            var newType = new JsonObject();
+            newType.Add("InventorySpecialSlotType", "TechBonus");
+            newEntry.Add("Type", newType);
+            var newIndex = new JsonObject();
+            newIndex.Add("X", cell.GridX);
+            newIndex.Add("Y", cell.GridY);
+            newEntry.Add("Index", newIndex);
+            specialSlots.Add(newEntry);
+            cell.IsSupercharged = true;
+            currentCount++;
+            cell.UpdateDisplay();
+        }
+    }
+
+    private void OnFillStack(object? sender, EventArgs e)
+    {
+        if (_contextCell?.SlotData == null) return;
+        int max = _contextCell.MaxAmount;
+        if (max <= 0) return;
+        _contextCell.SlotData.Set("Amount", max);
+        _contextCell.Amount = max;
+        _contextCell.UpdateDisplay();
+        if (_selectedCell == _contextCell)
+            _detailAmount.NumericValue = max;
+        RaiseDataModified();
+    }
+
+    private void OnRechargeAllTech(object? sender, EventArgs e)
+    {
+        int recharged = 0;
+        foreach (var cell in _cells)
+        {
+            if (cell.SlotData == null || string.IsNullOrEmpty(cell.ItemId)) continue;
+            if (!cell.IsTechChargeable) continue;
+            if (cell.MaxAmount <= 0) continue;
+            cell.SlotData.Set("Amount", cell.MaxAmount);
+            cell.Amount = cell.MaxAmount;
+            cell.UpdateDisplay();
+            recharged++;
+        }
+        if (_selectedCell != null && _selectedCell.IsTechChargeable)
+            _detailAmount.NumericValue = Math.Clamp(_selectedCell.Amount, (int)(_detailAmount.Minimum ?? int.MinValue), (int)(_detailAmount.Maximum ?? int.MaxValue));
+        if (recharged > 0) RaiseDataModified();
+    }
+
+    private void OnRefillAllStacks(object? sender, EventArgs e)
+    {
+        int refilled = 0;
+        foreach (var cell in _cells)
+        {
+            if (cell.SlotData == null || string.IsNullOrEmpty(cell.ItemId)) continue;
+            if (cell.MaxAmount <= 0) continue;
+            cell.SlotData.Set("Amount", cell.MaxAmount);
+            cell.Amount = cell.MaxAmount;
+            cell.UpdateDisplay();
+            refilled++;
+        }
+        if (_selectedCell != null && _selectedCell.MaxAmount > 0)
+            _detailAmount.NumericValue = Math.Clamp(_selectedCell.Amount, (int)(_detailAmount.Minimum ?? int.MinValue), (int)(_detailAmount.Maximum ?? int.MaxValue));
+        if (refilled > 0) RaiseDataModified();
+    }
+
+    private sealed class SlotSortEntry
+    {
+        public required JsonObject Slot { get; init; }
+        public required string ItemId { get; init; }
+        public required string SortName { get; init; }
+        public required string SortCategory { get; init; }
+        public int OriginalX { get; init; }
+        public int OriginalY { get; init; }
+    }
+
+    private void OnSortModeChanged(object? sender, EventArgs e)
+    {
+        if (_suppressSortModeEvents) return;
+        if (_sortModeCombo.SelectedItem is not SortModeOption option) return;
+
+        _currentSortMode = option.Mode;
+        ApplyCurrentSortMode(true);
+    }
+
+    private void OnSortByName(object? sender, EventArgs e)
+    {
+        SetSortMode(InventorySortMode.Name, applySort: true, raiseModified: true);
+    }
+
+    private void OnSortByCategory(object? sender, EventArgs e)
+    {
+        SetSortMode(InventorySortMode.Category, applySort: true, raiseModified: true);
+    }
+
+    private void OnAutoStackToStorage(object? sender, EventArgs e)
+    {
+        if (ReferenceEquals(sender, _autoStackToStorageMenuItem)
+            && AutoStackSelectedSlotToStorageRequested != null
+            && TryBuildAutoStackSlotRequest(out var requestArgs))
+        {
+            AutoStackSelectedSlotToStorageRequested?.Invoke(this, requestArgs);
+            return;
+        }
+
+        AutoStackToStorageRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnAutoStackToStarship(object? sender, EventArgs e)
+    {
+        if (ReferenceEquals(sender, _autoStackToStarshipMenuItem)
+            && AutoStackSelectedSlotToStarshipRequested != null
+            && TryBuildAutoStackSlotRequest(out var requestArgs))
+        {
+            AutoStackSelectedSlotToStarshipRequested?.Invoke(this, requestArgs);
+            return;
+        }
+
+        AutoStackToStarshipRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnAutoStackToFreighter(object? sender, EventArgs e)
+    {
+        if (ReferenceEquals(sender, _autoStackToFreighterMenuItem)
+            && AutoStackSelectedSlotToFreighterRequested != null
+            && TryBuildAutoStackSlotRequest(out var requestArgs))
+        {
+            AutoStackSelectedSlotToFreighterRequested?.Invoke(this, requestArgs);
+            return;
+        }
+
+        AutoStackToFreighterRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private bool TryBuildAutoStackSlotRequest(out AutoStackSlotRequestEventArgs requestArgs)
+    {
+        requestArgs = null!;
+
+        if (_contextCell == null || _contextCell.SlotData == null || string.IsNullOrEmpty(_contextCell.ItemId) || _contextCell.IsValidEmpty)
+            return false;
+
+        requestArgs = new AutoStackSlotRequestEventArgs(_contextCell.GridX, _contextCell.GridY, _contextCell.ItemId);
+        return true;
+    }
+
+    private void SortInventory(Comparison<SlotSortEntry> comparison, bool raiseModified)
+    {
+        if (_currentInventory == null || _slots == null) return;
+
+        _isApplyingSort = true;
+        try
+        {
+            var entries = new List<SlotSortEntry>();
+            var unsortedSlots = new List<JsonObject>();
+            for (int i = 0; i < _slots.Length; i++)
+            {
+                JsonObject? slot;
+                try { slot = _slots.GetObject(i); }
+                catch { continue; }
+                if (slot == null) continue;
+
+                string itemId;
+                try { itemId = ExtractItemId(slot.Get("Id")); }
+                catch
+                {
+                    unsortedSlots.Add(slot);
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(itemId) || itemId == "^" || itemId == "^YOURSLOTITEM")
+                {
+                    unsortedSlots.Add(slot);
+                    continue;
+                }
+
+                int x = 0;
+                int y = 0;
+                try
+                {
+                    var index = slot.GetObject("Index");
+                    if (index != null)
+                    {
+                        x = index.GetInt("X");
+                        y = index.GetInt("Y");
+                    }
+                }
+                catch { }
+
+                string sortName = itemId;
+                string sortCategory = "";
+                if (_database != null)
+                {
+                    var (gameItem, displayName, _, _) = ResolveItemAndDisplayName(itemId);
+                    if (gameItem != null)
+                    {
+                        sortName = string.IsNullOrEmpty(displayName) ? itemId : displayName;
+                        sortCategory = gameItem.Category ?? "";
+                    }
+                }
+
+                entries.Add(new SlotSortEntry
+                {
+                    Slot = slot,
+                    ItemId = itemId,
+                    SortName = sortName,
+                    SortCategory = sortCategory,
+                    OriginalX = x,
+                    OriginalY = y,
+                });
+            }
+
+            if (entries.Count < 2) return;
+
+            var targetPositions = GetSortablePositions(_currentInventory);
+            if (targetPositions.Count == 0) return;
+
+            targetPositions.Sort((a, b) =>
+            {
+                int byY = a.y.CompareTo(b.y);
+                return byY != 0 ? byY : a.x.CompareTo(b.x);
+            });
+
+            entries.Sort((a, b) =>
+            {
+                int byRule = comparison(a, b);
+                if (byRule != 0) return byRule;
+                int byY = a.OriginalY.CompareTo(b.OriginalY);
+                return byY != 0 ? byY : a.OriginalX.CompareTo(b.OriginalX);
+            });
+
+            int assignCount = Math.Min(entries.Count, targetPositions.Count);
+            for (int i = 0; i < assignCount; i++)
+                InventorySlotHelper.UpdateSlotIndex(entries[i].Slot, targetPositions[i].x, targetPositions[i].y);
+
+            var newSlots = new JsonArray();
+            foreach (var entry in entries)
+                newSlots.Add(entry.Slot);
+            foreach (var unsorted in unsortedSlots)
+                newSlots.Add(unsorted);
+
+            _currentInventory.Set("Slots", newSlots);
+            _slots = newSlots;
+            LoadInventory(_currentInventory);
+            if (raiseModified)
+                RaiseDataModified();
+        }
+        finally
+        {
+            _isApplyingSort = false;
+        }
+    }
+
+    private static List<(int x, int y)> GetSortablePositions(JsonObject inventory)
+    {
+        var positions = new List<(int x, int y)>();
+        var seen = new HashSet<(int x, int y)>();
+
+        try
+        {
+            var validSlots = inventory.GetArray("ValidSlotIndices");
+            if (validSlots != null)
+            {
+                for (int i = 0; i < validSlots.Length; i++)
+                {
+                    try
+                    {
+                        var idx = validSlots.GetObject(i);
+                        if (idx == null) continue;
+                        var pos = (idx.GetInt("X"), idx.GetInt("Y"));
+                        if (seen.Add(pos)) positions.Add(pos);
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+
+        if (positions.Count > 0) return positions;
+
+        int width = GridColumns;
+        int height = 1;
+        try
+        {
+            int invWidth = inventory.GetInt("Width");
+            int invHeight = inventory.GetInt("Height");
+            if (invWidth > 0) width = invWidth;
+            if (invHeight > 0) height = invHeight;
+        }
+        catch { }
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+                positions.Add((x, y));
+        }
+        return positions;
+    }
+
+    private void OnCopyItem(object? sender, EventArgs e)
+    {
+        if (_contextCell == null || _contextCell.SlotData == null || string.IsNullOrEmpty(_contextCell.ItemId)) return;
+        // Store a reference to the copied cell (deep copy not needed, values will be read on paste)
+        _copiedItemCell = _contextCell;
+    }
+
+    private void OnPasteItem(object? sender, EventArgs e)
+    {
+        if (_contextCell == null || _copiedItemCell == null || _copiedItemCell.SlotData == null || _slots == null) return;
+
+        var newSlot = InventorySlotHelper.DuplicateSlot(_copiedItemCell.SlotData, _contextCell.GridX, _contextCell.GridY);
+
+        // Replace or add slot in inventory
+        if (_contextCell.SlotData != null && _contextCell.SlotIndex >= 0)
+        {
+            _slots.Set(_contextCell.SlotIndex, newSlot);
+        }
+        else
+        {
+            _slots.Add(newSlot);
+            _contextCell.SlotIndex = _slots.Length - 1;
+        }
+
+        // Update cell
+        _contextCell.SlotData = newSlot;
+        _contextCell.IsValidEmpty = false;
+        _contextCell.IsEmpty = false;
+        LoadCellData(_contextCell);
+        _contextCell.UpdateDisplay();
+
+        // Select the pasted cell
+        SelectCell(_contextCell);
+        RaiseDataModified();
+    }
+
+    private void OnResizeInventory(object? sender, EventArgs e)
+    {
+        if (_currentInventory == null) return;
+
+        int newWidth = (int)(_resizeWidth.NumericValue ?? 10);
+        int newHeight = (int)(_resizeHeight.NumericValue ?? 6);
+
+        var validSlots = _currentInventory.GetArray("ValidSlotIndices");
+        if (validSlots == null)
+        {
+            validSlots = new JsonArray();
+            _currentInventory.Set("ValidSlotIndices", validSlots);
+        }
+
+        // Build set of existing valid indices
+        var existingValid = new HashSet<(int, int)>();
+        for (int i = 0; i < validSlots.Length; i++)
+        {
+            try
+            {
+                var idx = validSlots.GetObject(i);
+                if (idx != null) existingValid.Add((idx.GetInt("X"), idx.GetInt("Y")));
+            }
+            catch { }
+        }
+
+        // Remove ValidSlotIndices outside new dimensions
+        for (int i = validSlots.Length - 1; i >= 0; i--)
+        {
+            try
+            {
+                var idx = validSlots.GetObject(i);
+                if (idx != null)
+                {
+                    int x = idx.GetInt("X"), y = idx.GetInt("Y");
+                    if (x >= newWidth || y >= newHeight)
+                        validSlots.RemoveAt(i);
+                }
+            }
+            catch { }
+        }
+
+        // Add ValidSlotIndices for new positions
+        for (int y = 0; y < newHeight; y++)
+        {
+            for (int x = 0; x < newWidth; x++)
+            {
+                if (!existingValid.Contains((x, y)))
+                {
+                    var newIdx = new JsonObject();
+                    newIdx.Add("X", x);
+                    newIdx.Add("Y", y);
+                    validSlots.Add(newIdx);
+                }
+            }
+        }
+
+        // Update inventory Width and Height so LoadInventory reads the new dimensions
+        _currentInventory.Set("Width", newWidth);
+        _currentInventory.Set("Height", newHeight);
+
+        // Reset corvette part matches so they can be re-resolved during reload
+        if (_corvettePartCollection != null)
+            foreach (var entry in _corvettePartCollection)
+                entry.Found = false;
+
+        // Reload the grid
+        LoadInventory(_currentInventory);
+        RaiseDataModified();
+    }
+
+    private void OnExportInventory(object? sender, EventArgs e)
+    {
+        if (_currentInventory == null)
+        {
+            MessageBox.Show(this, UiStrings.Get("inventory.no_inventory_export"), UiStrings.Get("inventory.export_title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            Filter = _exportFilter,
+            DefaultExt = _exportDefaultExt,
+            FileName = _exportFileName
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            var json = JsonParser.Serialize(_currentInventory, true, skipReverseMapping: true);
+            File.WriteAllText(dialog.FileName, json);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, UiStrings.Format("inventory.export_error", ex.Message), UiStrings.Get("inventory.export_error_title"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OnImportInventory(object? sender, EventArgs e)
+    {
+        if (_currentInventory == null)
+        {
+            MessageBox.Show(this, UiStrings.Get("inventory.no_inventory_import"), UiStrings.Get("inventory.import_title"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Filter = _importFilter,
+            DefaultExt = _exportDefaultExt
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            string json = File.ReadAllText(dialog.FileName);
+            var imported = JsonParser.ParseObject(json);
+
+            // Try to locate inventory data inside the parsed object.
+            // Supports raw inventory files (Slots at top level) as well as
+            // NMSSaveEditor / NomNom wrapper formats where inventory is nested.
+            var inventory = InventoryImportHelper.FindInventoryObject(imported);
+            if (inventory == null)
+            {
+                MessageBox.Show(this, UiStrings.Get("inventory.import_bad_format"),
+                    UiStrings.Get("inventory.import_error_title"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Copy relevant fields from imported inventory into current inventory
+            var importedSlots = inventory.GetArray("Slots");
+            _currentInventory.Set("Slots", importedSlots!);
+
+            var importedValid = inventory.GetArray("ValidSlotIndices");
+            if (importedValid != null)
+                _currentInventory.Set("ValidSlotIndices", importedValid);
+
+            var importedSpecial = inventory.GetArray("SpecialSlots");
+            if (importedSpecial != null)
+                _currentInventory.Set("SpecialSlots", importedSpecial);
+
+            // Update dimensions if present in the imported data
+            try
+            {
+                int w = inventory.GetInt("Width");
+                int h = inventory.GetInt("Height");
+                if (w > 0 && h > 0)
+                {
+                    _currentInventory.Set("Width", w);
+                    _currentInventory.Set("Height", h);
+                }
+            }
+            catch { }
+
+            // Reload the grid with the imported data
+            LoadInventory(_currentInventory);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, UiStrings.Format("inventory.import_failed", ex.Message), UiStrings.Get("inventory.import_error_title"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void ClearDetailPanel()
+    {
+        _detailItemName.Text = UiStrings.Get("inventory.no_slot_selected");
+        _detailSlotPosition.Text = "";
+        _detailItemType.Text = "";
+        _detailItemCategory.Text = "";
+        _detailItemId.Text = "";
+        _detailAmount.NumericValue = 0;
+        _detailMaxAmount.NumericValue = 0;
+        _detailDamageFactor.NumericValue = 0;
+        _detailDescription.Text = "";
+        _detailIcon.Image = null;
+        _detailClassIcon.Image = null;
+        _detailAmount.Enabled = true;
+        _detailMaxAmount.Enabled = true;
+        _applyButton.Enabled = false;
+        UpdateSeedFieldVisibility(null);
+    }
+
+    private void ClearPickerDetailPanel()
+    {
+        _pickerItemName.Text = UiStrings.Get("inventory.picker_no_item");
+        _pickerItemId.Text = "";
+        _pickerAmount.NumericValue = 0;
+        _pickerMaxAmount.NumericValue = 0;
+        _pickerDamageFactor.NumericValue = 0;
+        _pickerDescription.Text = "";
+        _pickerIcon.Image = null;
+        _pickerClassIcon.Image = null;
+        _pickerAmount.Enabled = true;
+        _pickerMaxAmount.Enabled = true;
+        _pickerApplyButton.Enabled = false;
+        UpdatePickerSeedFieldVisibility(null);
+    }
+
+    /// <summary>
+    /// Updates the picker Add/Replace button text based on whether the
+    /// currently selected slot contains an item.
+    /// </summary>
+    private void UpdatePickerApplyButtonText()
+    {
+        bool slotHasItem = _selectedCell != null && !_selectedCell.IsEmpty
+            && !(_selectedCell.IsValidEmpty && string.IsNullOrEmpty(_selectedCell.ItemId));
+        _pickerApplyButton.Text = slotHasItem
+            ? UiStrings.Get("inventory.picker_replace_item")
+            : UiStrings.Get("inventory.picker_add_item");
+        _pickerApplyButton.Enabled = _selectedCell != null && _itemPicker.SelectedItem is GameItem;
+    }
+
+    /// <summary>
+    /// Changes are applied immediately via OnApplyChanges/OnAddItem/OnRemoveItem.
+    /// </summary>
+    public void SaveInventory(JsonObject? inventory)
+    {
+        // Changes are written directly to slot JsonObjects
+    }
+
+    public void ApplyUiLocalisation()
+    {
+        // Resize controls
+        _resizeWidthLabel.Text = UiStrings.Get("inventory.width");
+        _resizeHeightLabel.Text = UiStrings.Get("inventory.height");
+        _resizeButton.Text = UiStrings.Get("inventory.resize");
+        _sortModeLabel.Text = UiStrings.Get("inventory.toolbar_sort");
+        _autoStackDropDownButton.Text = UiStrings.Get("inventory.toolbar_auto_stack");
+        _autoStackToChestsButtonMenuItem.Text = UiStrings.Get("inventory.toolbar_auto_stack_chests");
+        _autoStackToStarshipButtonMenuItem.Text = UiStrings.Get("inventory.toolbar_auto_stack_starship");
+        _autoStackToFreighterButtonMenuItem.Text = UiStrings.Get("inventory.toolbar_auto_stack_freighter");
+        PopulateSortModeOptions();
+
+        // Slot detail panel labels
+        _detailAmountLabel.Text = UiStrings.Get("inventory.amount");
+        _detailMaxLabel.Text = UiStrings.Get("inventory.max");
+        _applyButton.Text = UiStrings.Get("inventory.apply_changes_title");
+
+        // Search
+        _searchBox.PlaceholderText = UiStrings.Get("inventory.search_placeholder");
+        _searchButton.Text = UiStrings.Get("inventory.search");
+
+        // Context menu
+        _addItemMenuItem.Text = UiStrings.Get("inventory.ctx_add_item");
+        _removeItemMenuItem.Text = UiStrings.Get("inventory.ctx_remove_item");
+        _enableSlotMenuItem.Text = UiStrings.Get("inventory.ctx_enable_slot");
+        _enableAllSlotsMenuItem.Text = UiStrings.Get("inventory.ctx_enable_all");
+        _repairSlotMenuItem.Text = UiStrings.Get("inventory.ctx_repair_slot");
+        _repairAllSlotsMenuItem.Text = UiStrings.Get("inventory.ctx_repair_all");
+        _superchargeSlotMenuItem.Text = UiStrings.Get("inventory.ctx_supercharge");
+        _superchargeAllSlotsMenuItem.Text = UiStrings.Get("inventory.ctx_supercharge_all");
+        _fillStackMenuItem.Text = UiStrings.Get("inventory.ctx_fill_stack");
+        _rechargeAllTechMenuItem.Text = UiStrings.Get("inventory.ctx_recharge_all");
+        _refillAllStacksMenuItem.Text = UiStrings.Get("inventory.ctx_refill_all");
+        _copyItemMenuItem.Text = UiStrings.Get("inventory.ctx_copy");
+        _pasteItemMenuItem.Text = UiStrings.Get("inventory.ctx_paste");
+        _sortByNameMenuItem.Text = UiStrings.Get("inventory.ctx_sort_name");
+        _sortByCategoryMenuItem.Text = UiStrings.Get("inventory.ctx_sort_category");
+        _autoStackToStorageMenuItem.Text = UiStrings.Get("inventory.ctx_auto_stack_chests");
+        _autoStackToStarshipMenuItem.Text = UiStrings.Get("inventory.ctx_auto_stack_starship");
+        _autoStackToFreighterMenuItem.Text = UiStrings.Get("inventory.ctx_auto_stack_freighter");
+        _pinSlotMenuItem.Text = UiStrings.Get("inventory.ctx_pin_slot");
+
+        // Import/Export buttons
+        _importButton.Text = UiStrings.Get("common.import");
+        _exportButton.Text = UiStrings.Get("common.export");
+
+        // Section headers
+        _slotDetailHeader.Text = UiStrings.Get("inventory.slot_details");
+        _itemPickerHeader.Text = UiStrings.Get("inventory.item_picker");
+
+        // Slot detail panel labels
+        _detailNameLabel.Text = UiStrings.Get("inventory.label_name");
+        _detailPositionLabel.Text = UiStrings.Get("inventory.label_slot");
+        _detailTypeLabel.Text = UiStrings.Get("inventory.label_type");
+        _detailCategoryLabel.Text = UiStrings.Get("inventory.label_category");
+        _detailItemIdLabel.Text = UiStrings.Get("inventory.label_item_id");
+        _detailGenSeedButton.Text = UiStrings.Get("inventory.button_gen_seed");
+        _detailDamageLabel.Text = UiStrings.Get("inventory.label_damage");
+        _detailInfoHintLabel.Text = UiStrings.Get("inventory.hover_info");
+
+        // Picker detail panel labels
+        _pickerNameLabel.Text = UiStrings.Get("inventory.label_name");
+        _pickerItemIdLabel.Text = UiStrings.Get("inventory.label_item_id");
+        _pickerGenSeedButton.Text = UiStrings.Get("inventory.button_gen_seed");
+        _pickerDamageLabel.Text = UiStrings.Get("inventory.label_damage");
+        _pickerAmountLabel.Text = UiStrings.Get("inventory.amount");
+        _pickerMaxLabel.Text = UiStrings.Get("inventory.max");
+        _pickerInfoHintLabel.Text = UiStrings.Get("inventory.hover_info");
+        UpdatePickerApplyButtonText();
+
+        // Search/filter labels
+        _searchLabel.Text = UiStrings.Get("inventory.label_search");
+        _typeFilterLabel.Text = UiStrings.Get("inventory.label_filter_type");
+        _categoryFilterLabel.Text = UiStrings.Get("inventory.label_filter_category");
+        _itemFilterLabel.Text = UiStrings.Get("inventory.label_filter_item");
+
+        // Re-populate type filter to pick up localised display names
+        PopulateTypeFilter();
+    }
+
+    /// <summary>
+    /// Tracks a base object in a corvette's PlayerShipBase for matching against CV_ tech items.
+    /// </summary>
+    private class CorvettePartEntry
+    {
+        public string Id { get; set; } = "";
+        public bool Found { get; set; }
+    }
+
+    /// <summary>
+    /// Wraps a raw category string with a human-readable display name.
+    /// PascalCase values like "AllShips" are shown as "All Ships" in the picker
+    /// while keeping the raw value for filtering.
+    /// </summary>
+    private sealed class CategoryDisplayItem
+    {
+        public string RawValue { get; }
+        public string DisplayName { get; }
+
+        public CategoryDisplayItem(string rawValue)
+        {
+            RawValue = rawValue;
+            DisplayName = NormalizeCategoryDisplay(rawValue);
+        }
+
+        public override string ToString() => DisplayName;
+
+        /// <summary>
+        /// Convert PascalCase or ALL-CAPS category names to space-separated readable text.
+        /// e.g. "AllShips" -> "All Ships", "AllShipsExceptAlien" -> "All Ships Except Alien",
+        /// "CONSUMABLE" -> "Consumable", "PROCEDURAL" -> "Procedural".
+        /// Single-word names like "Suit", "Ship", "Weapon" are returned unchanged.
+        /// </summary>
+        internal static string NormalizeCategoryDisplay(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return raw;
+
+            // Handle ALL-CAPS words: title-case them first (e.g. "CONSUMABLE" -> "Consumable")
+            if (raw.Length > 1 && raw == raw.ToUpperInvariant())
+                return char.ToUpper(raw[0]) + raw[1..].ToLower();
+
+            // Insert space before each uppercase letter that follows a lowercase letter
+            // or before an uppercase letter followed by a lowercase letter after another uppercase
+            var spaced = System.Text.RegularExpressions.Regex.Replace(raw, @"(?<=[a-z])([A-Z])|(?<=[A-Z])([A-Z][a-z])", " $1$2");
+            return spaced;
+        }
+    }
+
+    /// <summary>
+    /// Wraps a raw item-type name (JSON filename) with a localised display name.
+    /// The InternalName is used for data filtering; DisplayName is shown in the UI.
+    /// </summary>
+    private sealed class TypeDisplayItem
+    {
+        public string InternalName { get; }
+        public string DisplayName { get; }
+
+        public TypeDisplayItem(string internalName)
+        {
+            InternalName = internalName;
+            string locKey = "item_type." + internalName
+                .Replace(" ", "_")
+                .ToLowerInvariant();
+            string locValue = UiStrings.Get(locKey);
+            // Fall back to the raw name if the loc key returns the key itself
+            DisplayName = locValue == locKey ? internalName : locValue;
+        }
+
+        public override string ToString() => DisplayName;
+    }
+
+    /// <summary>
+    /// Returns a localised category name for display in the detail panel.
+    /// Looks up "item_category.{normalised_key}" and falls back to NormalizeCategoryDisplay.
+    /// </summary>
+    private static string GetLocalisedCategoryName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return UiStrings.Get("inventory.category_na");
+
+        string locKey = "item_category." + CategoryDisplayItem.NormalizeCategoryDisplay(raw)
+            .ToLowerInvariant()
+            .Replace(" & ", "_")
+            .Replace("'", "")
+            .Replace(" ", "_");
+        string locValue = UiStrings.Get(locKey);
+        return locValue == locKey
+            ? CategoryDisplayItem.NormalizeCategoryDisplay(raw)
+            : locValue;
+    }
+
+    // =====================================================
+    // Handle exhaustion fix for large inventories:
+    // owner-draw each cell in a lightweight Panel subclass.
+    // This was necessary due to the 10,000 GDI USER handle
+    // limit in WinForms being exceeded:
+    // hitting ~1,200+ handles for a general grid size.
+    // This will not be relevant later in porting the UI.
+    // =====================================================
+
+    /// <summary>
+    /// Individual slot cell in the inventory grid.
+    /// <para>
+    /// Owner-drawn: all visual elements (icon, name bar, amount bar, pin indicator,
+    /// adjacency borders, element badges, class mini-icons) are rendered in
+    /// <see cref="OnPaint"/> and <see cref="OnPaintBackground"/>.  No child controls
+    /// are created, so each cell consumes exactly <b>1 window handle</b> instead of 6.
+    /// This allows the original per-tab grid architecture (each tab keeps its own
+    /// <see cref="InventoryGridPanel"/> with cells alive) without hitting the per-process
+    /// GDI handle limit.
+    /// </para>
+    /// <para>
+    /// Marquee scrolling for long item names is handled by a shared
+    /// <see cref="System.Windows.Forms.Timer"/> and an offset counter, drawn directly
+    /// in <see cref="OnPaint"/>.
+    /// </para>
+    /// <para>
+    /// Pin-toggle interaction is handled via hit-testing in <see cref="OnMouseClick"/>
+    /// and hover state in <see cref="OnMouseMove"/>/<see cref="OnMouseLeave"/>.
+    /// </para>
+    /// </summary>
+    internal void ApplyThemePalette(ThemeColors.Palette p)
+    {
+        _currentPalette = p;
+        foreach (var cell in _cells)
+            cell.ApplyPalette(p);
+    }
+
+    private class SlotCell : Panel
+    {
+        private ThemeColors.Palette _palette = ThemeColors.Light;
+
+        internal void ApplyPalette(ThemeColors.Palette p)
+        {
+            _palette = p;
+            Invalidate();
+        }
+
+        // Shared fonts reduce GDI object allocation per cell.
+        // These live for the application lifetime (3 GDI objects) and must NOT be disposed.
+        // If you are disposing of these, you are going to have a bad time.
+        private static readonly Font SharedNameFont = new Font("Segoe UI", 12f, FontStyle.Regular, GraphicsUnit.Pixel);
+        private static readonly Font SharedAmountFont = new Font("Segoe UI", 12f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private static readonly Font SharedElementBadgeFont = new Font("Segoe UI", 21f, FontStyle.Bold, GraphicsUnit.Pixel);
+
+        // Layout constants matching the old child-control arrangement
+        private const int NameBarHeight = 18;
+        private const int AmountBarHeight = 16;
+        private const int PinSize = 16;
+        private const int MarqueeIntervalMs = 90; // milliseconds per marquee tick
+
+        private readonly ToolTip _toolTip;
+        private Image? _compositeImage; // tracks composite bitmaps we create so only they are disposed
+
+        // Cached display image (composited icon with class/badge overlays)
+        private Image? _displayImage;
+
+        // Cached display strings (computed once in UpdateDisplay, painted in OnPaint)
+        private string _nameText = "";
+        private bool _nameVisible;
+        private Color _nameForeColor = Color.White;
+        private string _amountText = "";
+        private bool _amountVisible;
+        private string _pinText = "";
+        private bool _pinVisible;
+        private Color _pinForeColor = Color.Gainsboro;
+
+        // Marquee scrolling state
+        private System.Windows.Forms.Timer? _marqueeTimer;
+        private int _marqueeOffset;
+        private bool _shouldScroll;
+
+        // Pin hover state for interactive feedback
+        private bool _pinHovered;
+
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int GridX { get; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int GridY { get; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int SlotIndex { get; set; } = -1;
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public JsonObject? SlotData { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string ItemId { get; set; } = "";
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string DisplayName { get; set; } = "";
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string ItemType { get; set; } = "";
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string Category { get; set; } = "";
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int Amount { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public int MaxAmount { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public double DamageFactor { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsEmpty { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsValidEmpty { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Image? IconImage { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsActivated { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsSupercharged { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string ItemClass { get; set; } = "";
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Image? ClassMiniIcon { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool ShowAdjacencyBorder { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Color AdjacencyBorderColor { get; set; } = Color.Transparent;
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsInTechInventory { get; set; }
+        /// <summary>
+        /// Whether the game data flags this item as rechargeable (Chargeable == true).
+        /// Set from <see cref="GameItem.IsChargeable"/> when the cell is populated.
+        /// </summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsChargeable { get; set; }
+
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool ShowPinToggle { get; set; }
+
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsPinnedForAutoStack { get; set; }
+
+        public event EventHandler? PinToggleClicked;
+
+        /// <summary>
+        /// Binary body bytes (between '^' and '#') from the original <see cref="BinaryData"/>
+        /// item ID. <c>null</c> when the item ID was a plain ASCII string.
+        /// Used to reconstruct <see cref="BinaryData"/> when writing back a changed seed.
+        /// </summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public byte[]? OriginalBinaryIdBody { get; set; }
+
+        /// <summary>Cached corvette-resolved display name. Preserved across drag/drop so
+        /// the greedy GuessCorvetteBasePart match is not lost when cells move.</summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string? CorvetteDisplayName { get; set; }
+        /// <summary>Cached corvette-resolved icon name for re-loading after drag/drop.</summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string? CorvetteIconName { get; set; }
+
+        /// <summary>Triggers a repaint to show/hide adjacency border.</summary>
+        public void UpdateBorderOverlay()
+        {
+            Invalidate();
+        }
+
+        /// <summary>
+        /// True when this is a chargeable technology item that displays charge as
+        /// a percentage. For technology items this is only true when
+        /// the game data's <c>Chargeable</c> flag is set.
+        /// Items like <c>Advanced Mining Laser</c>, <c>Analysis Visor</c>, and <c>Combat Scope</c> have
+        /// <c>Chargeable: false</c> despite having non-zero Amount/MaxAmount in the
+        /// save file, so they must not show a charge bar.
+        /// </summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsTechChargeable =>
+            IsInTechInventory
+            && IsChargeable
+            && Amount >= 0 && MaxAmount > 0;
+
+        private bool _isSelected;
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool IsSelected
+        {
+            get => _isSelected;
+            set { _isSelected = value; UpdateDisplay(); }
+        }
+
+        public SlotCell(int x, int y, int width, int height, ToolTip sharedToolTip)
+        {
+            GridX = x;
+            GridY = y;
+            Size = new Size(width, height);
+            BorderStyle = BorderStyle.FixedSingle;
+            Cursor = Cursors.Hand;
+            BackColor = _palette.InventoryGridBg;
+
+            // Owner-drawn: enable double-buffering and all-paint-in-WM_PAINT
+            SetStyle(
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.UserPaint |
+                ControlStyles.ResizeRedraw,
+                true);
+
+            _toolTip = sharedToolTip;
+        }
+
+        /// <summary>
+        /// Returns the hit-test rectangle for the pin indicator, relative to
+        /// the cell's client area.
+        /// </summary>
+        private Rectangle GetPinRect()
+        {
+            int px = Math.Max(0, ClientSize.Width - PinSize);
+            int py = Math.Max(2, ClientSize.Height - AmountBarHeight - PinSize - 3);
+            return new Rectangle(px, py, PinSize, PinSize);
+        }
+
+        // ---- Hit-test & mouse interaction for pin toggle ----
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && _pinVisible && GetPinRect().Contains(e.Location))
+            {
+                PinToggleClicked?.Invoke(this, EventArgs.Empty);
+                return; // Consume the click - don't propagate as cell selection
+            }
+            base.OnMouseClick(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_pinVisible)
+            {
+                bool over = GetPinRect().Contains(e.Location);
+                if (over != _pinHovered)
+                {
+                    _pinHovered = over;
+                    Invalidate(GetPinRect()); // repaint just the pin area
+                }
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_pinHovered)
+            {
+                _pinHovered = false;
+                Invalidate(GetPinRect());
+            }
+        }
+
+        // ---- Marquee scrolling ----
+
+        private void CheckMarquee()
+        {
+            if (!_nameVisible || string.IsNullOrEmpty(_nameText))
+            {
+                StopMarquee();
+                return;
+            }
+            if (!IsHandleCreated) return;
+            using var g = CreateGraphics();
+            var tw = (int)g.MeasureString(_nameText, SharedNameFont).Width;
+            _shouldScroll = tw > ClientSize.Width * 0.9;
+            if (_shouldScroll)
+            {
+                _marqueeOffset = 0;
+                EnsureMarqueeTimer();
+                _marqueeTimer!.Start();
+            }
+            else
+            {
+                StopMarquee();
+            }
+        }
+
+        private void EnsureMarqueeTimer()
+        {
+            if (_marqueeTimer != null) return;
+            _marqueeTimer = new System.Windows.Forms.Timer { Interval = MarqueeIntervalMs };
+            _marqueeTimer.Tick += (s, e) =>
+            {
+                if (IsDisposed || !IsHandleCreated || !Visible) { _marqueeTimer?.Stop(); return; }
+                _marqueeOffset += 2;
+                // Only invalidate the name bar area
+                Invalidate(new Rectangle(0, 0, ClientSize.Width, NameBarHeight));
+            };
+        }
+
+        private void StopMarquee()
+        {
+            _marqueeTimer?.Stop();
+            _marqueeOffset = 0;
+            _shouldScroll = false;
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (!Visible) _marqueeTimer?.Stop();
+            else if (IsHandleCreated && _shouldScroll) { EnsureMarqueeTimer(); _marqueeTimer!.Start(); }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // CheckMarquee() uses CreateGraphics() which requires IsHandleCreated.
+            // When UpdateDisplay() runs during LoadInventory (before the cell is
+            // parented to the form), the handle doesn't exist yet and CheckMarquee
+            // bails out.  Re-evaluate here so scrolling starts as soon as the
+            // control is live.
+            CheckMarquee();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            _marqueeTimer?.Stop();
+            base.OnHandleDestroyed(e);
+        }
+
+        // ---- Owner-drawn rendering ----
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            base.OnPaintBackground(e);
+
+            // Adjacency border on the panel background
+            if (ShowAdjacencyBorder && AdjacencyBorderColor != Color.Transparent)
+            {
+                var r = ClientRectangle;
+                using var pen = new Pen(AdjacencyBorderColor, 2f);
+                pen.Alignment = System.Drawing.Drawing2D.PenAlignment.Inset;
+                e.Graphics.DrawRectangle(pen, r);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            var cs = ClientSize;
+            int w = cs.Width;
+            int h = cs.Height;
+
+            // ---- Icon area (between name bar and amount bar) ----
+            // Draws the icon scaled to fit (Zoom) within the visible area between
+            // the name bar and amount bar.  No lift or clipping needed - the icon
+            // sits entirely within the container region so the class mini-icon and
+            // element badge at the top-left corner remain fully visible.
+            if (_displayImage != null)
+            {
+                int iconTop = NameBarHeight;
+                int iconHeight = h - NameBarHeight - AmountBarHeight;
+                if (iconHeight > 0)
+                {
+                    float scale = Math.Min((float)w / _displayImage.Width,
+                                           (float)iconHeight / _displayImage.Height);
+                    int iw = (int)(_displayImage.Width * scale);
+                    int ih = (int)(_displayImage.Height * scale);
+                    int ix = (w - iw) / 2;
+                    int iy = iconTop + (iconHeight - ih) / 2;
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(_displayImage, ix, iy, iw, ih);
+                }
+            }
+
+            // ---- Name bar (top) ----
+            if (_nameVisible && !string.IsNullOrEmpty(_nameText))
+            {
+                var nameRect = new Rectangle(0, 0, w, NameBarHeight);
+                using (var barBrush = new SolidBrush(Color.FromArgb(160, 0, 0, 0)))
+                    g.FillRectangle(barBrush, nameRect);
+
+                using var textBrush = new SolidBrush(_nameForeColor);
+                if (_shouldScroll)
+                {
+                    // Marquee: scroll text left, wrapping
+                    var textWidth = (int)g.MeasureString(_nameText, SharedNameFont).Width;
+                    int x = -_marqueeOffset;
+                    while (x < w)
+                    {
+                        g.DrawString(_nameText, SharedNameFont, textBrush, x, 0);
+                        x += textWidth + 40;
+                    }
+                    if (_marqueeOffset > textWidth + 40) _marqueeOffset = 0;
+                }
+                else
+                {
+                    // Centred, ellipsis-trimmed
+                    using var sf = new StringFormat
+                    {
+                        Alignment = StringAlignment.Center,
+                        LineAlignment = StringAlignment.Center,
+                        FormatFlags = StringFormatFlags.NoWrap,
+                        Trimming = StringTrimming.EllipsisCharacter
+                    };
+                    g.DrawString(_nameText, SharedNameFont, textBrush, nameRect, sf);
+                }
+            }
+
+            // ---- Amount bar (bottom) ----
+            if (_amountVisible && !string.IsNullOrEmpty(_amountText))
+            {
+                var amountRect = new Rectangle(0, h - AmountBarHeight, w, AmountBarHeight);
+                using (var barBrush = new SolidBrush(Color.FromArgb(128, 0, 0, 0)))
+                    g.FillRectangle(barBrush, amountRect);
+
+                using var amtBrush = new SolidBrush(Color.White);
+                using var sf = new StringFormat
+                {
+                    Alignment = StringAlignment.Center,
+                    LineAlignment = StringAlignment.Near,
+                    FormatFlags = StringFormatFlags.NoWrap,
+                    Trimming = StringTrimming.EllipsisCharacter
+                };
+                g.DrawString(_amountText, SharedAmountFont, amtBrush, amountRect, sf);
+            }
+
+            // ---- Pin indicator (bottom-right, above amount bar) ----
+            // Use TextRenderer (GDI) instead of Graphics.DrawString (GDI+)
+            // because GDI+ cannot render color emoji (lock and unlock) - they show as
+            // empty boxes.  TextRenderer correctly falls back to Segoe UI Emoji.
+            // These should change to a bitmap / SVG later like a lot of the other glyphs.
+            if (_pinVisible)
+            {
+                var pinRect = GetPinRect();
+                using (var pinBg = new SolidBrush(Color.FromArgb(128, 0, 0, 0)))
+                    g.FillRectangle(pinBg, pinRect);
+
+                Color pinColor = _pinHovered ? Color.White : _pinForeColor;
+                TextRenderer.DrawText(g, _pinText, SharedNameFont, pinRect, pinColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+            }
+
+            // ---- Adjacency border (on top of everything) ----
+            if (ShowAdjacencyBorder && AdjacencyBorderColor != Color.Transparent)
+            {
+                using var pen = new Pen(AdjacencyBorderColor, 2f);
+                pen.Alignment = System.Drawing.Drawing2D.PenAlignment.Inset;
+                g.DrawRectangle(pen, ClientRectangle);
+            }
+
+            base.OnPaint(e);
+        }
+
+        // ---- UpdateDisplay: compute all cached values, then Invalidate once ----
+
+        public void UpdateDisplay()
+        {
+            if (IsEmpty)
+            {
+                // Disabled slot - not in ValidSlotIndices and no data
+                Color bg = _isSelected ? _palette.InventorySlotSelected : _palette.InventoryGridBg;
+                if (!IsActivated) bg = _palette.InventorySlotDeactivated;
+                BackColor = bg;
+                _displayImage = null;
+                ClassMiniIcon = null;
+                _nameText = "";
+                _nameVisible = false;
+                _amountText = "";
+                _amountVisible = false;
+                Cursor = Cursors.Hand;
+                string tip = IsActivated ? UiStrings.Format("inventory.tooltip_empty", GridX, GridY) : UiStrings.Format("inventory.tooltip_disabled", GridX, GridY);
+                _toolTip.SetToolTip(this, tip);
+                UpdatePinCachedState();
+                StopMarquee();
+                Invalidate();
+                return;
+            }
+
+            if (IsValidEmpty && string.IsNullOrEmpty(ItemId))
+            {
+                Color bg;
+                if (IsSupercharged)
+                    bg = _isSelected ? Color.FromArgb(180, 160, 60) : Color.Gold;
+                else if (_isSelected)
+                    bg = Color.FromArgb(70, 100, 160);
+                else
+                    bg = Color.FromArgb(45, 45, 50);
+                if (!IsActivated) bg = Color.FromArgb(80, 30, 30);
+                BackColor = bg;
+                _displayImage = null;
+                ClassMiniIcon = null;
+                _nameText = IsSupercharged ? SuperchargeIndicator : "";
+                _nameForeColor = IsSupercharged ? Color.Gold : Color.White;
+                _nameVisible = IsSupercharged;
+                _amountText = "";
+                _amountVisible = false;
+                Cursor = Cursors.Hand;
+                string tip = UiStrings.Format("inventory.tooltip_empty_slot", GridX, GridY);
+                _toolTip.SetToolTip(this, tip);
+                UpdatePinCachedState();
+                CheckMarquee();
+                Invalidate();
+                return;
+            }
+
+            // Set background color by item type
+            Color baseColor;
+            if (IsSupercharged)
+                baseColor = Color.Gold;
+            else if (_isSelected)
+                baseColor = Color.FromArgb(80, 120, 200);
+            else if (ItemType.Contains("technology", StringComparison.OrdinalIgnoreCase))
+                baseColor = Color.FromArgb(40, 60, 120);
+            else if (ItemType.Contains("product", StringComparison.OrdinalIgnoreCase))
+                baseColor = Color.FromArgb(120, 80, 30);
+            else if (ItemType.Contains("substance", StringComparison.OrdinalIgnoreCase))
+                baseColor = Color.FromArgb(30, 100, 100);
+            else if (!string.IsNullOrEmpty(ItemId))
+                baseColor = Color.FromArgb(60, 60, 60);
+            else
+                baseColor = _palette.InventoryGridBg;
+
+            if (!IsActivated && !_isSelected)
+                baseColor = Color.FromArgb(
+                    Math.Min(255, baseColor.R / 2 + 60),
+                    baseColor.G / 4,
+                    baseColor.B / 4);
+
+            // Background colour - adjacency border is drawn in OnPaint, no
+            // BorderStyle changes needed (changing BorderStyle shifts ClientSize
+            // by the border width, causing a visible "pop" on selection).
+            BackColor = baseColor;
+
+            // Composite icon + class mini-icon + element badge into _displayImage
+            BuildDisplayImage();
+
+            // Name text
+            string nameText = !string.IsNullOrEmpty(DisplayName) ? DisplayName : ItemId;
+            if (IsSupercharged && !string.IsNullOrEmpty(nameText))
+                nameText = SuperchargeIndicator + nameText;
+            _nameText = nameText ?? "";
+            _nameForeColor = IsSupercharged ? Color.Gold : Color.White;
+            _nameVisible = !string.IsNullOrEmpty(_nameText);
+
+            // Amount text
+            if (IsTechChargeable && MaxAmount > 0)
+            {
+                int pct = (int)Math.Ceiling((double)Amount / MaxAmount * 100);
+                _amountText = $"{pct}%";
+                _amountVisible = true;
+            }
+            else if (IsInTechInventory && !IsChargeable)
+            {
+                _amountText = "";
+                _amountVisible = false;
+            }
+            else
+            {
+                _amountText = $"{Amount}/{MaxAmount}";
+                _amountVisible = true;
+            }
+
+            // Tooltip
+            string tip2 = !string.IsNullOrEmpty(DisplayName) ? DisplayName : ItemId;
+            if (IsSupercharged) tip2 = SuperchargeIndicator + " " + tip2;
+            if (!IsActivated) tip2 += " [disabled]";
+            if (IsTechChargeable && MaxAmount > 0)
+            {
+                int pct2 = (int)Math.Ceiling((double)Amount / MaxAmount * 100);
+                tip2 += $" ({pct2}%)";
+            }
+            else if (IsInTechInventory && !IsChargeable)
+            {
+                // No amount info in tooltip for non-chargeable installed tech
+            }
+            else
+                tip2 += $" ({Amount}/{MaxAmount})";
+            _toolTip.SetToolTip(this, tip2);
+
+            UpdatePinCachedState();
+            CheckMarquee();
+            Invalidate();
+        }
+
+        /// <summary>
+        /// Builds the composited display image (icon + class mini-icon + element badge).
+        /// </summary>
+        private void BuildDisplayImage()
+        {
+            var oldComposite = _compositeImage;
+
+            string? elementSymbol = !string.IsNullOrEmpty(DisplayName) ? ElementDatabase.GetSymbol(DisplayName) : null;
+            bool needsComposite = (IconImage != null && ClassMiniIcon != null) || elementSymbol != null;
+
+            if (needsComposite && IconImage != null)
+            {
+                var composite = new Bitmap(IconImage.Width, IconImage.Height,
+                    System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(composite))
+                {
+                    g.DrawImage(IconImage, 0, 0, IconImage.Width, IconImage.Height);
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
+                    if (ClassMiniIcon != null)
+                        g.DrawImage(ClassMiniIcon, -IconImage.Width*0.05f, 0, IconImage.Width*0.5f, IconImage.Height*0.5f);
+
+                    if (elementSymbol != null)
+                    {
+                        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        var font = SharedElementBadgeFont;
+                        var textSize = g.MeasureString(elementSymbol, font);
+                        float pad = 2f;
+                        float buffer = 10f;
+                        float bh = textSize.Height + pad;
+                        float bw = textSize.Width + pad * 2 + buffer;
+                        float bx = IconImage.Width * 0.04f;
+                        float by = IconImage.Height * 0.04f;
+                        float radius = bh / 2f;
+
+                        if (bw < bh * 1.5f)
+                            bw = bh * 1.5f;
+
+                        using var badgePath = new System.Drawing.Drawing2D.GraphicsPath();
+                        badgePath.AddArc(bx, by, bh, bh, 90, 180);
+                        badgePath.AddLine(bx + radius, by, bx + bw - radius, by);
+                        badgePath.AddArc(bx + bw - bh, by, bh, bh, 270, 180);
+                        badgePath.AddLine(bx + bw - radius, by + bh, bx + radius, by + bh);
+                        badgePath.CloseFigure();
+
+                        using var bgBrush = new SolidBrush(Color.FromArgb(209, 227, 226, 200));
+                        g.FillPath(bgBrush, badgePath);
+                        using var textBrush = new SolidBrush(Color.FromArgb(53, 57, 57));
+                        float textX = bx + (bw - textSize.Width) / 2f;
+                        float textY = by + pad * 0.5f;
+                        g.DrawString(elementSymbol, font, textBrush, textX, textY);
+                    }
+                }
+                _displayImage = composite;
+                _compositeImage = composite;
+            }
+            else
+            {
+                _displayImage = IconImage;
+                _compositeImage = null;
+            }
+
+            if (oldComposite != null)
+                oldComposite.Dispose();
+        }
+
+        private void UpdatePinCachedState()
+        {
+            bool show = ShowPinToggle && IsActivated;
+            _pinVisible = show;
+            if (!show) return;
+
+            _pinText = IsPinnedForAutoStack ? "🔒" : "🔓";
+            _pinForeColor = IsPinnedForAutoStack ? Color.Gold : Color.Gainsboro;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _marqueeTimer?.Dispose();
+                _marqueeTimer = null;
+                // Do NOT dispose _toolTip - it is shared across all cells and
+                // owned by the parent InventoryGridPanel!
+                // Only dispose our composite bitmap, never shared cached icons.
+                if (_compositeImage != null)
+                {
+                    _compositeImage.Dispose();
+                    _compositeImage = null;
+                }
+            }
+            base.Dispose(disposing);
+        }
+    }
+}
