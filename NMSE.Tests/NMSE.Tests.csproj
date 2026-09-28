@@ -130,6 +130,7 @@
   <!-- Config (application settings - no WinForms dependency) -->
   <ItemGroup>
     <Compile Include="..\Config\AppConfig.cs" Link="Config\AppConfig.cs" />
+    <Compile Include="..\NMS.CLI\CommandLine.cs" Link="NMS.CLI\CommandLine.cs" />
   </ItemGroup>
 
 </Project>

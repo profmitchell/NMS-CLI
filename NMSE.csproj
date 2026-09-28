@@ -80,6 +80,10 @@
 		<Content Remove="NMSE.Extractor.Tests\**" />
 		<EmbeddedResource Remove="NMSE.Extractor.Tests\**" />
 		<None Remove="NMSE.Extractor.Tests\**" />
+		<Compile Remove="NMS.CLI\**" />
+		<Content Remove="NMS.CLI\**" />
+		<EmbeddedResource Remove="NMS.CLI\**" />
+		<None Remove="NMS.CLI\**" />
 		<Compile Remove="_ref\**" />
 		<Content Remove="_ref\**" />
 		<EmbeddedResource Remove="_ref\**" />

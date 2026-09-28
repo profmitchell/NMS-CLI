@@ -90,6 +90,11 @@ Save file reading, writing, compression, encryption, and platform abstraction.
 - Lz4Compressor, Lz4CompressorStream, Lz4BufferedCompressorStream
 - Lz4ChunkedCompressorStream, Lz4DecompressorStream
 
+### [CLI Foundation](cli-foundation.md)
+
+NMS-CLI initial architecture and command-line Phase 1 scope, including the
+GUI-to-logic method mapping used to keep NMSE as the authoritative save backend.
+
 ### [Models](models.md)
 
 Domain model classes, the custom JSON tree, and value types.
